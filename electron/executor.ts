@@ -51,6 +51,7 @@ type QueueItem = {
 
 type ShareRecoveryResult = {
   shareUrl: string | null;
+  directVideoUrl?: string | null;
   candidateCount: number;
   promptMatchCount: number;
   generatedMatchCount: number;
@@ -236,7 +237,7 @@ export class DoubaoExecutor {
         requestId,
         status: "running",
         executionPhase: "sharing",
-        message: "正在定位豆包已生成视频并重试复制分享链接"
+        message: "正在定位豆包已生成视频结果"
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
@@ -253,9 +254,25 @@ export class DoubaoExecutor {
         await wait(2500);
         await dismissDoubaoDesktopDownloadPrompt(win);
         if (await looksLoggedOut(win)) throw new Error("豆包账号未登录，无法恢复视频结果");
-        recovery = await findGeneratedConversationAndCopyShare(win, request.prompt, request.sourceConversationUrl || request.doubaoThreadUrl, async (message) => {
+        recovery = await findGeneratedConversationAndCopyShare(win, promptWithVideoOptions(request), request.sourceConversationUrl || request.doubaoThreadUrl, async (message) => {
           await progress({ requestId, status: "running", message });
         }, this.database.getOtherBoundConversations(account.id, requestId));
+      }
+      if (recovery.directVideoUrl && /^https?:\/\//i.test(recovery.directVideoUrl)) {
+        const outputVideoPath = settings.outputDir
+          ? await downloadVideoIfNeeded(settings, requestId, recovery.directVideoUrl).catch(() => null)
+          : null;
+        await progress({
+          requestId,
+          status: "success",
+          message: outputVideoPath ? "已恢复豆包视频并保存到本地" : "已恢复豆包返回的视频",
+          doubaoThreadUrl: request.sourceConversationUrl || request.doubaoThreadUrl,
+          rawVideoUrl: recovery.directVideoUrl,
+          cleanVideoUrl: recovery.directVideoUrl,
+          outputVideoPath
+        });
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        return;
       }
       if (!recovery.shareUrl) {
         if (recovery.failureMessage) {
@@ -299,7 +316,7 @@ export class DoubaoExecutor {
       const shareUrl = resolvedVideo.shareUrl;
       const cleanVideo = resolvedVideo.cleanVideo;
       const cleanVideoUrl = cleanVideo.url;
-      const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
+      const outputVideoPath = await downloadVideoIfNeeded(settings, requestId, cleanVideoUrl);
       await progress({
         requestId,
         status: "success",
@@ -414,13 +431,16 @@ export class DoubaoExecutor {
           message: formatGenerationSettings(request)
         });
 
-        if (request.referenceImagePath) {
+        const referenceImagePaths = request.referenceImagePaths.length
+          ? request.referenceImagePaths
+          : request.referenceImagePath ? [request.referenceImagePath] : [];
+        if (referenceImagePaths.length) {
           await progress({
             requestId,
             status: "running",
-            message: attempt === 1 ? "正在上传参考图" : "正在重新上传参考图"
+            message: attempt === 1 ? `正在上传 ${referenceImagePaths.length} 张参考图` : `正在重新上传 ${referenceImagePaths.length} 张参考图`
           });
-          await uploadReferenceImage(win!, request.referenceImagePath);
+          await uploadReferenceImages(win!, referenceImagePaths);
         }
 
         await progress({
@@ -428,7 +448,7 @@ export class DoubaoExecutor {
           status: "running",
           message: attempt === 1 ? "正在填写提示词" : "正在重新填写提示词"
         });
-        await fillPrompt(win!, request.prompt);
+        await fillPrompt(win!, promptWithVideoOptions(request));
 
         const selectedBeforeSubmit = await inspectSelectedVideoModel(win!);
         const requestedModel = request.model === "seedance_2_0_mini" ? "mini" : "fast";
@@ -464,7 +484,7 @@ export class DoubaoExecutor {
           await submitPromptAndWait(
             win,
             request.model,
-            request.prompt,
+            promptWithVideoOptions(request),
             async (message) => {
               await progress({ requestId, status: "running", message,
                 ...message === "已触发本任务发送，正在独立等待豆包受理确认" ? { submissionSentAt: new Date().toISOString() } : {} });
@@ -504,11 +524,11 @@ export class DoubaoExecutor {
         });
       }
 
-      await progress({
-        requestId,
-        status: "running",
-        message: "已提交豆包，等待视频完成并复制分享链接"
-      });
+        await progress({
+          requestId,
+          status: "running",
+          message: "已提交豆包，等待视频完成"
+        });
 
       const generationResult = await waitForGenerationResult(
         win,
@@ -517,7 +537,7 @@ export class DoubaoExecutor {
         generationBaseline.videoUrls,
         generationBaseline.playableVideoCount,
         generationBaseline.videoCardCount,
-        request.prompt,
+        promptWithVideoOptions(request),
         submittedConversationUrl,
         async (message) => {
         await progress({ requestId, status: "running", executionPhase: /分享|复制/.test(message) ? "sharing" : "generating", message });
@@ -527,44 +547,25 @@ export class DoubaoExecutor {
         }
       );
 
-      if (!generationResult.shareUrl) {
-        throw new Error(
-          `视频已生成，但未提取到豆包分享链接，无法获取去水印视频${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`
-        );
+      const videoUrl = generationResult.directVideoUrl;
+      if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) {
+        throw new Error(`视频已生成，但没有提取到本次视频的直链${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`);
       }
-
-      this.recordOperation(
-        request,
-        "复制分享地址",
-        "success",
-        "已复制豆包 thread/share 地址，等待去水印接口验证真实 MP4",
-        generationResult.shareUrl
-      );
-
-      if (!request.removeWatermark) {
-        throw new Error("接口仅返回去水印视频，本次请求未启用去水印");
+      const doubaoThreadUrl = generationResult.shareUrl || submittedConversationUrl;
+      let outputVideoPath: string | null = null;
+      if (settings.outputDir) {
+        await progress({ requestId, status: "running", executionPhase: "output", message: "正在保存豆包返回的视频" });
+        try { outputVideoPath = await downloadVideoIfNeeded(settings, requestId, videoUrl); }
+        catch (error) { this.recordOperation(request, "保存视频", "failed", `视频链接已返回，本地保存失败：${errorMessage(error)}`, videoUrl); }
       }
-
-      const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
-        request,
-        settings,
-        generationResult.shareUrl
-      );
-      const doubaoThreadUrl = resolvedVideo.shareUrl;
-      const cleanVideo = resolvedVideo.cleanVideo;
-      const cleanVideoUrl = cleanVideo.url;
-      if (settings.outputDir) await progress({ requestId, status: "running", executionPhase: "output", message: "正在保存已验证的去水印 MP4" });
-      const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
 
       await progress({
         requestId,
         status: "success",
-        message: outputVideoPath
-          ? `视频生成完成，去水印 MP4 已验证并保存到本地（${formatWatermarkResolution(cleanVideo)}）`
-          : `视频生成完成，去水印 MP4 地址已验证（${formatWatermarkResolution(cleanVideo)}）`,
+        message: outputVideoPath ? "视频生成完成，已返回豆包视频并保存到本地" : "视频生成完成，已返回豆包视频",
         doubaoThreadUrl,
-        rawVideoUrl: null,
-        cleanVideoUrl,
+        rawVideoUrl: videoUrl,
+        cleanVideoUrl: videoUrl,
         outputVideoPath
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -844,14 +845,16 @@ async function looksLoggedOut(win: BrowserWindow) {
   `);
 }
 
-async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
-  const resolvedPath = path.resolve(imagePath);
-  const stat = await fs.stat(resolvedPath).catch(() => null);
-  if (!stat?.isFile()) {
-    throw new Error(`参考图不存在：${resolvedPath}`);
+async function uploadReferenceImages(win: BrowserWindow, imagePaths: string[]) {
+  const resolvedPaths: string[] = [];
+  for (const imagePath of imagePaths) {
+    const resolvedPath = path.resolve(imagePath);
+    const stat = await fs.stat(resolvedPath).catch(() => null);
+    if (!stat?.isFile()) throw new Error(`参考图不存在：${resolvedPath}`);
+    resolvedPaths.push(resolvedPath);
   }
 
-  if (await setFirstFileInput(win, resolvedPath)) {
+  if (await setFileInputFiles(win, resolvedPaths)) {
     await wait(2500);
     return;
   }
@@ -859,7 +862,7 @@ async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
   await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
   await wait(1200);
 
-  if (await setFirstFileInput(win, resolvedPath)) {
+  if (await setFileInputFiles(win, resolvedPaths)) {
     await wait(2500);
     return;
   }
@@ -867,7 +870,7 @@ async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
   throw new Error("没有找到豆包页面的图片上传控件");
 }
 
-async function setFirstFileInput(win: BrowserWindow, filePath: string) {
+async function setFileInputFiles(win: BrowserWindow, filePaths: string[]) {
   const debug = win.webContents.debugger;
   let attachedHere = false;
   try {
@@ -886,7 +889,7 @@ async function setFirstFileInput(win: BrowserWindow, filePath: string) {
     if (!inputs.nodeIds.length) return false;
     await debug.sendCommand("DOM.setFileInputFiles", {
       nodeId: inputs.nodeIds[0],
-      files: [filePath]
+      files: filePaths
     });
     return true;
   } finally {
@@ -2384,9 +2387,10 @@ async function waitForGenerationResult(
     if (generated || generatedAt > 0) {
       if (!generatedAt) {
         generatedAt = Date.now();
-        await onProgress("视频已生成，正在进入分享模式并复制链接");
+        await onProgress("视频已生成，正在读取豆包返回的视频地址");
       }
       directVideoUrl ||= pageState.directVideoUrl;
+      if (generated && directVideoUrl) return { shareUrl: null, directVideoUrl };
 
       const copied = await tryCopyShareLink(win);
       shareFailureReason = copied.reason;
@@ -2405,6 +2409,7 @@ async function waitForGenerationResult(
           extractDoubaoConversationUrl(originalUrl) || preferredConversationUrl,
           onProgress
         );
+        if (recovery.directVideoUrl) return { shareUrl: null, directVideoUrl: recovery.directVideoUrl };
         if (recovery.shareUrl) {
           return { shareUrl: recovery.shareUrl, directVideoUrl };
         }
@@ -2420,6 +2425,7 @@ async function waitForGenerationResult(
         lastShareRecoveryAt = Date.now();
         await onProgress("视频已生成，分享资源仍在同步，正在恢复本次对话结果");
         const recovery = await findGeneratedConversationAndCopyShare(win, prompt, preferredConversationUrl || extractDoubaoConversationUrl(win.webContents.getURL()), onProgress);
+        if (recovery.directVideoUrl) return { shareUrl: null, directVideoUrl: recovery.directVideoUrl };
         if (recovery.shareUrl) return { shareUrl: recovery.shareUrl, directVideoUrl };
         shareFailureReason = recovery.shareFailureReason || shareFailureReason;
       }
@@ -2462,8 +2468,9 @@ async function waitForGenerationResult(
 
   if (generatedAt) {
     await onProgress("视频已生成，正在最后恢复本次分享结果");
-    const recovery = await findGeneratedConversationAndCopyShare(win, prompt, preferredConversationUrl || extractDoubaoConversationUrl(win.webContents.getURL()), onProgress);
-    if (recovery.shareUrl) return { shareUrl: recovery.shareUrl, directVideoUrl };
+      const recovery = await findGeneratedConversationAndCopyShare(win, prompt, preferredConversationUrl || extractDoubaoConversationUrl(win.webContents.getURL()), onProgress);
+      if (recovery.directVideoUrl) return { shareUrl: null, directVideoUrl: recovery.directVideoUrl };
+      if (recovery.shareUrl) return { shareUrl: recovery.shareUrl, directVideoUrl };
     shareFailureReason = recovery.shareFailureReason || shareFailureReason;
     return { shareUrl: null, directVideoUrl, shareFailureReason };
   }
@@ -2474,6 +2481,7 @@ async function waitForGenerationResult(
     extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl,
     onProgress
   );
+  if (recovery.directVideoUrl) return { shareUrl: null, directVideoUrl: recovery.directVideoUrl };
   if (recovery.shareUrl) {
     return { shareUrl: recovery.shareUrl, directVideoUrl };
   }
@@ -2711,8 +2719,20 @@ async function findGeneratedConversationAndCopyShare(
       shareFailureReason = "匹配对话已完成，但视频卡片仍未渲染";
       continue;
     }
+    if (pageState.directVideoUrl && /^https?:\/\//i.test(pageState.directVideoUrl)) {
+      return {
+        shareUrl: null,
+        directVideoUrl: pageState.directVideoUrl,
+        candidateCount: orderedCandidates.length,
+        promptMatchCount,
+        generatedMatchCount: generatedMatchCount + 1,
+        pendingMatchCount,
+        failureMessage,
+        shareFailureReason: null
+      };
+    }
     generatedMatchCount += 1;
-    await onProgress("已检测到新版视频卡片，正在复制当前视频分享链接");
+    await onProgress("已检测到新版视频卡片，正在读取豆包返回的视频地址");
 
     const shareStartedAt = Date.now();
     let shareAttempt = 0;
@@ -3699,7 +3719,7 @@ async function clickByKeywords(win: BrowserWindow, keywords: string[]) {
   `);
 }
 
-async function downloadCleanVideoIfNeeded(settings: AppSettings, requestId: string, cleanVideoUrl: string) {
+async function downloadVideoIfNeeded(settings: AppSettings, requestId: string, cleanVideoUrl: string) {
   if (!settings.outputDir.trim()) return null;
   await fs.mkdir(settings.outputDir, { recursive: true });
   const response = await fetch(cleanVideoUrl);
@@ -3757,9 +3777,13 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
 }
 
-function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "prompt">) {
+function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "duration" | "resolution">) {
   const model = request.model === "seedance_2_0_mini" ? "mini" : "fast";
-  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${extractPromptDuration(request.prompt) || "未指定"}`;
+  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${request.duration}秒 分辨率：${request.resolution}`;
+}
+
+function promptWithVideoOptions(request: Pick<ApiRequest, "prompt" | "duration" | "resolution">) {
+  return `${request.prompt.trim()}\n\n生成要求：视频总时长为 ${request.duration} 秒，分辨率为 ${request.resolution}。请按要求生成。`;
 }
 
 function extractPromptDuration(prompt: string) {

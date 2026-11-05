@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
-import { Check, ChevronDown, ClipboardList, Copy, ExternalLink, History, Info, MoreHorizontal, Plus, RefreshCw, RotateCcw, Save, Search, Settings2, ShieldCheck, Square, Trash2, Users, X } from "@lucide/vue";
+import { Check, ChevronDown, ClipboardList, Copy, History, Info, MoreHorizontal, Plus, RefreshCw, RotateCcw, Save, Search, Settings2, Square, Trash2, Users, X } from "@lucide/vue";
 import { failureStageLabels, getRequestError, requestPhase } from "../electron/request-diagnostics";
 import { quotaAmount, quotaRuns } from "../electron/quota-amount";
 import type {
@@ -15,8 +15,7 @@ import type {
   OperationLog,
   OperationLogStatus,
   FailureStage,
-  RequestStats,
-  WatermarkStatus
+  RequestStats
 } from "../electron/types";
 
 type TabKey = "accounts" | "settings" | "logs" | "actions";
@@ -25,7 +24,6 @@ const accounts = ref<Account[]>([]);
 const apiRequests = ref<ApiRequest[]>([]);
 const todayGeneratedCount = ref(0);
 const requestStats = ref<RequestStats>({ todaySuccess: 0, todayFailed: 0, running: 0, queued: 0 });
-const watermarkStatus = ref<WatermarkStatus>({ configured: false, usage: null, checkedAt: null, usageUpdatedAt: null, error: null });
 const savedSettings = ref<AppSettings | null>(null);
 const savingSettings = ref(false);
 const notice = ref("");
@@ -69,7 +67,7 @@ const settingsForm = reactive<AppSettings>({
   showExecutorWindow: false,
   autoCloseExecutorWindow: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
-  defaultModel: "seedance_2_0_mini",
+  defaultModel: "seedance_2_0_fast",
   dailyQuotaLimit: 10,
   miniCost: 2,
   fastCost: 3,
@@ -78,8 +76,8 @@ const settingsForm = reactive<AppSettings>({
   maxConcurrentAccounts: 5,
   maxConcurrentTasksPerAccount: 3,
   retryCount: 1,
-  autoRemoveWatermark: true,
-  watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
+  autoRemoveWatermark: false,
+  watermarkApiUrl: "",
   watermarkApiToken: "",
   outputDir: ""
 });
@@ -89,18 +87,6 @@ const settingsDirty = computed(() => Boolean(savedSettings.value && Object.keys(
 )));
 const selectedError = computed(() => selectedRequest.value ? getRequestError(selectedRequest.value) : null);
 const selectedActions = computed(() => operationLogs.value.filter((item) => item.requestId === selectedRequest.value?.requestId).slice(0, 18).reverse());
-const watermarkTone = computed(() => {
-  if (watermarkStatus.value.error || watermarkStatus.value.usage?.remainingCount === 0) return "warning";
-  return watermarkStatus.value.usage ? "success" : "neutral";
-});
-const watermarkSummary = computed(() => {
-  const state = watermarkStatus.value;
-  if (!state.configured) return "未配置 Token";
-  if (state.error) return state.error.title;
-  if (state.usage?.remainingCount === 0) return "次数已用完";
-  return state.usage ? "已同步服务商用量" : "尚未同步";
-});
-
 const loginLabels: Record<LoginStatus, string> = {
   unknown: "未检测",
   logged_in: "已登录",
@@ -225,20 +211,12 @@ const apiExample = computed(() => {
   return `# 共享额度：账号每日 ${settingsForm.dailyQuotaLimit}，Mini 每次扣 ${settingsForm.miniCost}，Fast 每次扣 ${settingsForm.fastCost}
 curl -X POST http://127.0.0.1:${port}/api/generate \\
   -H "Authorization: Bearer ${token}" \\
-  -F "model=seedance_2_0_mini" \\
-  -F "prompt=生成一段 10 秒女性科普动画" \\
+  -F "model=seedance_2_0_fast" \\
+  -F "duration=15" \\
+  -F "resolution=720p" \\
+  -F "prompt=生成一段 15 秒女性科普动画" \\
   -F "referenceImage=@/Users/your-name/Pictures/ref.png" \\
-  -F "removeWatermark=true" \\
   -F "callbackUrl=http://127.0.0.1:3000/doubao/callback"`;
-});
-
-const watermarkExample = computed(() => {
-  const port = settingsForm.apiPort || 17888;
-  const token = "<api-key>";
-  return `curl -X POST http://127.0.0.1:${port}/api/watermark/parse \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url":"https://www.doubao.com/thread/xxx"}'`;
 });
 
 let removeDataChangedListener: (() => void) | null = null;
@@ -255,15 +233,14 @@ async function refresh() {
   dayStart.setHours(0, 0, 0, 0);
   const dayEnd = new Date(dayStart);
   dayEnd.setDate(dayEnd.getDate() + 1);
-  const [accountRows, settings, status, requests, actions, generatedCount, stats, watermark] = await Promise.all([
+  const [accountRows, settings, status, requests, actions, generatedCount, stats] = await Promise.all([
     window.doubaoManager.accounts.list(),
     window.doubaoManager.settings.get(),
     window.doubaoManager.apiServer.status(),
     window.doubaoManager.apiRequests.list(100),
     window.doubaoManager.operationLogs.list(500),
     window.doubaoManager.apiRequests.todaySuccessCount(dayStart.toISOString(), dayEnd.toISOString()),
-    window.doubaoManager.apiRequests.stats(dayStart.toISOString(), dayEnd.toISOString()),
-    window.doubaoManager.watermark.status()
+    window.doubaoManager.apiRequests.stats(dayStart.toISOString(), dayEnd.toISOString())
   ]);
   accounts.value = accountRows;
   apiRequests.value = requests;
@@ -271,7 +248,6 @@ async function refresh() {
   operationLogs.value = actions;
   apiStatus.value = status;
   requestStats.value = stats;
-  watermarkStatus.value = watermark;
   if (selectedRequest.value) selectedRequest.value = requests.find((item) => item.requestId === selectedRequest.value?.requestId) || selectedRequest.value;
   const keepEdits = settingsDirty.value;
   savedSettings.value = settings;
@@ -686,7 +662,7 @@ onBeforeUnmount(() => {
         <div class="activity-summary"><span>执行中 <strong>{{ requestStats.running }}</strong></span><span>今日完成 <strong class="text-success">{{ todayGeneratedCount }}</strong></span><span>今日失败 <strong>{{ requestStats.todayFailed }}</strong></span></div>
       </div>
 
-      <div class="service-balances" aria-label="生成额度与去水印次数">
+      <div class="service-balances" aria-label="生成额度">
         <div class="balance-row">
           <span class="balance-label"><Users :size="15" />豆包今日额度<Info :size="13" title="本地调度额度，执行中的任务已预扣；不是豆包官方余额" /></span>
           <strong class="balance-value">{{ accountQuotaSummary.remaining }}<span>/ {{ accountQuotaSummary.total }} 点剩余</span></strong>
@@ -694,19 +670,6 @@ onBeforeUnmount(() => {
           <span class="capacity">Mini <strong>{{ accountQuotaSummary.miniRuns }}</strong> 次<span class="divider">/</span>Fast <strong>{{ accountQuotaSummary.fastRuns }}</strong> 次</span>
           <span class="balance-meta" title="北京时间每天 00:00 自动重置；唤醒和重启时补检查">下次 {{ nextResetLabel() }}<span class="quota-reset-zone">北京时间 · 自动重置</span></span>
         </div>
-        <div class="balance-row" :class="`balance-${watermarkTone}`">
-          <span class="balance-label"><ShieldCheck :size="15" />去水印次数<Info :size="13" title="仅显示服务商解析响应返回的用量，不用本地生成数量推算余额" /></span>
-          <strong class="balance-value">{{ watermarkStatus.usage?.remainingCount ?? '—' }}<span>次剩余</span></strong>
-          <span class="balance-meta watermark-usage">已用 {{ watermarkStatus.usage?.usedCount ?? '—' }} / 总计 {{ watermarkStatus.usage?.totalLimit ?? '—' }}</span>
-          <span class="balance-state"><span class="status-dot"></span>{{ watermarkSummary }}</span>
-          <span class="balance-meta" :title="fullTime(watermarkStatus.usageUpdatedAt)">{{ watermarkStatus.usageUpdatedAt ? `${formatTime(watermarkStatus.usageUpdatedAt)} 同步` : '下次解析时同步' }}</span>
-          <button class="tool-button" title="刷新本地状态" aria-label="刷新额度状态" @click="refresh"><RefreshCw :size="14" /></button>
-        </div>
-      </div>
-
-      <div v-if="watermarkStatus.error || watermarkStatus.usage?.remainingCount === 0" class="service-alert">
-        <span>{{ watermarkStatus.error?.suggestion || '去水印次数已用完，补充次数后可恢复已有视频结果。' }}</span>
-        <button class="text-button" @click="activeTab = 'settings'">查看配置 <ExternalLink :size="13" /></button>
       </div>
 
       <div class="account-toolbar">
@@ -912,26 +875,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="form-section wide">
-          <h3>去水印服务</h3>
-          <div class="settings-usage" :class="`balance-${watermarkTone}`">
-            <span>{{ watermarkSummary }}</span>
-            <strong>剩余 {{ watermarkStatus.usage?.remainingCount ?? '—' }} 次</strong>
-            <span>已用 {{ watermarkStatus.usage?.usedCount ?? '—' }} / 总计 {{ watermarkStatus.usage?.totalLimit ?? '—' }}</span>
-            <small>{{ watermarkStatus.usageUpdatedAt ? `${fullTime(watermarkStatus.usageUpdatedAt)} 同步` : '尚未收到服务商用量数据' }}</small>
-          </div>
-          <p v-if="watermarkStatus.error" class="form-hint text-warning">{{ watermarkStatus.error.detail }} · {{ watermarkStatus.error.suggestion }}</p>
-          <label class="checkbox-line">
-            <input v-model="settingsForm.autoRemoveWatermark" type="checkbox" />
-            默认自动去水印
-          </label>
-          <label>
-            <span>接口地址</span>
-            <input v-model="settingsForm.watermarkApiUrl" />
-          </label>
-          <label>
-            <span>接口 Token</span>
-            <input v-model="settingsForm.watermarkApiToken" type="password" placeholder="nologo API Token" />
-          </label>
+          <h3>视频输出</h3>
           <label>
             <span>输出目录</span>
             <input v-model="settingsForm.outputDir" placeholder="/Users/your-name/Movies/doubao-output" />
@@ -943,8 +887,6 @@ onBeforeUnmount(() => {
         <details><summary>接口调用示例<ChevronDown :size="15" /></summary>
         <h3>生成请求</h3>
         <pre>{{ apiExample }}</pre>
-        <h3>单独去水印</h3>
-        <pre>{{ watermarkExample }}</pre>
         </details>
       </aside>
     </section>
@@ -978,8 +920,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
         <label class="log-failure-filter"><span>问题分类</span><select v-model="logFailureFilter">
-          <option value="all">全部问题</option><option value="quota_exhausted">去水印次数耗尽</option><option value="token">去水印认证问题</option>
-          <option value="watermark">所有去水印问题</option><option value="sharing">复制分享</option><option value="submission">生成确认</option><option value="generation">豆包生成</option><option value="account">账号与额度</option><option value="output">文件保存</option>
+          <option value="all">全部问题</option><option value="sharing">结果恢复</option><option value="submission">生成确认</option><option value="generation">豆包生成</option><option value="account">账号与额度</option><option value="output">文件保存</option>
         </select></label>
         <span class="log-count">显示 {{ filteredApiRequests.length }} / {{ apiRequests.length }} 条</span>
       </div>

@@ -38,7 +38,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   showExecutorWindow: false,
   autoCloseExecutorWindow: true,
   doubaoChatUrl: "https://www.doubao.com/chat",
-  defaultModel: "seedance_2_0_mini",
+  defaultModel: "seedance_2_0_fast",
   dailyQuotaLimit: 10,
   miniCost: 2,
   fastCost: 3,
@@ -107,11 +107,14 @@ export class AppDatabase {
         source TEXT NOT NULL DEFAULT 'local',
         model TEXT NOT NULL,
         aspect_ratio TEXT NOT NULL DEFAULT '16:9',
+        duration INTEGER NOT NULL DEFAULT 15,
+        resolution TEXT NOT NULL DEFAULT '720p',
         account_id INTEGER,
         status TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
         prompt TEXT NOT NULL,
         reference_image_path TEXT,
+        reference_image_paths TEXT NOT NULL DEFAULT '[]',
         remove_watermark INTEGER NOT NULL DEFAULT 1,
         callback_url TEXT,
         doubao_thread_url TEXT,
@@ -588,6 +591,8 @@ export class AppDatabase {
         api_requests.source,
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration,
+        api_requests.resolution,
         api_requests.account_id AS accountId,
         api_requests.requested_account_id AS requestedAccountId,
         api_requests.assignment_revision AS assignmentRevision,
@@ -599,6 +604,7 @@ export class AppDatabase {
         api_requests.error_json AS errorJson,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePathsJson,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -646,6 +652,8 @@ export class AppDatabase {
         api_requests.source,
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration,
+        api_requests.resolution,
         api_requests.account_id AS accountId,
         api_requests.requested_account_id AS requestedAccountId,
         api_requests.assignment_revision AS assignmentRevision,
@@ -657,6 +665,7 @@ export class AppDatabase {
         api_requests.error_json AS errorJson,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePathsJson,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -688,12 +697,15 @@ export class AppDatabase {
         source,
         model,
         aspect_ratio,
+        duration,
+        resolution,
         account_id,
         requested_account_id,
         status,
         message,
         prompt,
         reference_image_path,
+        reference_image_paths,
         remove_watermark,
         callback_url,
         quota_cost,
@@ -704,18 +716,21 @@ export class AppDatabase {
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
       input.model,
       input.aspectRatio || "16:9",
+      input.duration ?? 15,
+      input.resolution || "720p",
       input.accountId ?? null,
       input.requestedAccountId ?? null,
       input.status,
       input.message || "",
       input.prompt,
       input.referenceImagePath || null,
+      JSON.stringify(input.referenceImagePaths || (input.referenceImagePath ? [input.referenceImagePath] : [])),
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
       quotaAmount(input.quotaCost || 0),
@@ -920,6 +935,12 @@ export class AppDatabase {
     const existingCount = this.db.prepare("SELECT COUNT(*) AS count FROM settings").get() as { count: number };
     if (existingCount.count === 0) {
       this.updateSettings(DEFAULT_SETTINGS);
+      return;
+    }
+    const defaultModel = this.db.prepare("SELECT value FROM settings WHERE key = 'defaultModel'").get() as { value?: string } | undefined;
+    if (!defaultModel) this.db.prepare("INSERT INTO settings(key, value, updated_at) VALUES ('defaultModel', ?, ?)").run(JSON.stringify(DEFAULT_SETTINGS.defaultModel), now());
+    else if (defaultModel.value === JSON.stringify("seedance_2_0_mini")) {
+      this.db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = 'defaultModel'").run(JSON.stringify(DEFAULT_SETTINGS.defaultModel), now());
     }
   }
 
@@ -1012,7 +1033,10 @@ export class AppDatabase {
   private ensureApiRequestColumns() {
     this.addColumnIfMissing("api_requests", "source", "TEXT NOT NULL DEFAULT 'local'");
     this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT NOT NULL DEFAULT '16:9'");
+    this.addColumnIfMissing("api_requests", "duration", "INTEGER NOT NULL DEFAULT 15");
+    this.addColumnIfMissing("api_requests", "resolution", "TEXT NOT NULL DEFAULT '720p'");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
+    this.addColumnIfMissing("api_requests", "reference_image_paths", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
     this.addColumnIfMissing("api_requests", "doubao_thread_url", "TEXT");
@@ -1105,16 +1129,26 @@ function normalizeApiRequest(row: unknown): ApiRequest {
     removeWatermark: number | boolean;
     quotaRefunded: number | boolean;
     errorJson: string | null;
+    referenceImagePathsJson?: string | null;
   };
   let error = null;
   if (request.status === "failed") {
     try { error = request.errorJson ? JSON.parse(request.errorJson) : diagnoseRequest(request.message); }
     catch { error = diagnoseRequest(request.message); }
   }
-  const { errorJson: _errorJson, ...values } = request;
+  const { errorJson: _errorJson, referenceImagePathsJson, ...values } = request;
+  let referenceImagePaths: string[] = [];
+  try {
+    const parsed = referenceImagePathsJson ? JSON.parse(referenceImagePathsJson) : [];
+    if (Array.isArray(parsed)) referenceImagePaths = parsed.filter((item): item is string => typeof item === "string");
+  } catch { /* legacy or malformed rows fall back to the single-image column */ }
+  if (referenceImagePaths.length === 0 && request.referenceImagePath) referenceImagePaths = [request.referenceImagePath];
   return {
     ...values,
+    referenceImagePaths,
     aspectRatio: request.aspectRatio === "9:16" || request.aspectRatio === "16:9" ? request.aspectRatio : "16:9",
+    duration: Number.isInteger(request.duration) && request.duration >= 4 && request.duration <= 15 ? request.duration : 15,
+    resolution: request.resolution === "1080p" ? "1080p" : "720p",
     removeWatermark: Boolean(request.removeWatermark),
     quotaRefunded: Boolean(request.quotaRefunded),
     quotaReserved: Boolean(request.quotaReserved),

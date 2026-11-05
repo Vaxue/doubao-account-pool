@@ -39,9 +39,12 @@ Content-Type: multipart/form-data
 
 ```json
 {
-  "model": "seedance_2_0_mini",
+  "model": "seedance_2_0_fast",
   "aspectRatio": "9:16",
-  "prompt": "生成一段 5 秒视频"
+  "duration": 15,
+  "resolution": "720p",
+  "prompt": "生成一段 15 秒视频",
+  "referenceImages": ["/absolute/path/ref-1.png", "https://example.com/ref-2.png"]
 }
 ```
 
@@ -53,13 +56,16 @@ Content-Type: multipart/form-data
 | `model` | 否 | `seedance_2_0_mini` 或 `seedance_2_0_fast` |
 | `accountId` | 否 | 正整数账号 ID；省略则自动调度；指定账号不可用或余额不足时返回 409，不会偷偷换用其他账号 |
 | `aspectRatio` | 否 | `9:16` 或 `16:9`；省略时默认 `16:9`，保存到任务并在豆包窗口发送前校验 |
-| `referenceImage` | 否 | 上传的参考图片文件 |
-| `referenceImagePath` | 否 | 本机参考图片绝对路径 |
-| `referenceImageUrl` | 否 | 可下载的参考图片 URL |
+| `duration` | 否 | 整数 `4`–`15` 秒；省略时默认 `15`。账号池将该值写入发送给豆包对话的生成要求 |
+| `resolution` | 否 | `720p` 或 `1080p`；省略时默认 `720p`。账号池将该值写入发送给豆包对话的生成要求 |
+| `referenceImages` | 否 | 多张参考图：JSON 中为本机路径或 HTTP(S) URL 数组；multipart 中使用同名重复文件字段，最多 9 张 |
+| `referenceImage` | 否 | 兼容旧调用：单张上传图片；multipart 也可重复该字段传多张 |
+| `referenceImagePath` | 否 | 兼容旧调用：本机参考图片绝对路径 |
+| `referenceImageUrl` | 否 | 兼容旧调用：可下载的参考图片 URL |
 | `callbackUrl` | 否 | 状态变化时接收 JSON 的回调地址 |
 | `source` | 否 | 请求来源名称 |
 
-生成请求固定执行最终 MP4 结果验证。去水印失败、平台不支持或没有取得可播放 MP4 时，任务状态为 `failed`。
+生成请求成功后直接返回豆包对话页提取到的视频直链，不依赖第三方去水印服务；配置输出目录时可同时保存到本地。时长和分辨率会作为明确的生成要求随提示词发送给豆包对话，最终参数执行仍由豆包对话模型决定。
 
 有足够额度但达到并发上限时，请求仍可返回 `accepted` 并预扣额度进入队列。每条任务的准备、发送和受理等待独立进行，不因同账号前一条尚未受理而串行阻塞。若豆包明确限制并发，保留原文并等待已有任务结束，不绕过限制或无限催发。
 
@@ -79,7 +85,7 @@ Content-Type: multipart/form-data
 }
 ```
 
-分配版本在内部用于隔离旧执行的迟到更新、退款和回调，不改变公开状态枚举、成功结果或画布接入地址。
+分配版本在内部用于隔离旧执行的迟到更新、退款和回调，不改变公开状态枚举或画布接入地址。成功响应同时返回实际任务的 `duration` 和 `resolution`。
 
 ## 无限画布接入约定
 
@@ -88,8 +94,8 @@ Content-Type: multipart/form-data
 - 同一台电脑上的画布使用 `http://127.0.0.1:17888`；远程画布应通过受保护的 HTTPS 代理或隧道访问，不要把本地端口无认证暴露到公网。
 - 有回调服务时传入 `callbackUrl`；没有回调服务时按 3 到 5 秒轮询 `GET /api/requests/:requestId`。
 - 画布必须按 `requestId` 更新原任务，即使多个任务的账号、标题或提示词相同，也不能合并判断。
-- `cleanVideoUrl` 只能是经过验证的可播放 MP4 地址；`outputVideoPath` 只能是已经存在的本地 `.mp4` 文件。
-- `doubao.com/chat/...`、`doubao.com/thread/...` 和分享页地址只用于账号池内部恢复、复制和去水印解析，不能写入 `cleanVideoUrl`。
+- `cleanVideoUrl` 是豆包对话页提取的视频直链；`outputVideoPath` 只能是已经存在的本地 `.mp4` 文件。
+- `doubao.com/chat/...`、`doubao.com/thread/...` 和分享页地址只用于账号池内部定位对应对话，不作为视频结果返回。
 - 本地账号分区、Cookie、SQLite、参考图、输出视频和 Token 不属于接口参数，也不会随 Git 发布。
 
 ## 查询任务状态
@@ -131,7 +137,7 @@ Authorization: Bearer <api-key>
 
 ## 单独解析视频结果
 
-保存去水印地址或 Token 后，后续解析尝试读取最新配置，包括已经处于生成等待中的任务、结果恢复和独立解析，无需重启本地服务。已经发出的上游请求不会被撤回；有效 MP4 成功结果不因换配置而重复解析。失败时若发现配置已更新，在有限重试内切换；上限用完则返回 `watermark / configuration_changed`，可恢复已有结果，不重新生成视频。已结束的失败任务不会因保存配置而自动重跑。此机制不改变去水印协议，不代表任意第三方接口都兼容。
+生成任务不再调用第三方去水印接口；历史接口如仍存在，仅供旧版客户端兼容，不参与生成任务成功判定。
 
 ### 查询最近的去水印用量
 

@@ -170,16 +170,27 @@ class LocalApiServer {
           sendJson(response, 400, { error: "aspectRatio must be 9:16 or 16:9" });
           return;
         }
+        const duration = body.duration === undefined || body.duration === "" ? 15 : Number(body.duration);
+        if (!Number.isInteger(duration) || duration < 4 || duration > 15) {
+          sendJson(response, 400, { error: "duration must be an integer from 4 to 15" });
+          return;
+        }
+        const resolution = body.resolution === undefined || body.resolution === "" ? "720p" : body.resolution;
+        if (resolution !== "720p" && resolution !== "1080p") {
+          sendJson(response, 400, { error: "resolution must be 720p or 1080p" });
+          return;
+        }
 
         const accountId = body.accountId === undefined ? undefined : Number(body.accountId);
         if (accountId !== undefined && (!Number.isSafeInteger(accountId) || accountId < 1)) {
           sendJson(response, 400, { error: "accountId must be a positive integer" });
           return;
         }
-        const referenceImagePath = await prepareReferenceImage(body, requestId);
+        const referenceImagePaths = await prepareReferenceImages(body, requestId);
+        const referenceImagePath = referenceImagePaths[0] || null;
         refreshQuotas();
-        const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio,
-          prompt, referenceImagePath, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
+        const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio, duration, resolution,
+          prompt, referenceImagePath, referenceImagePaths, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
 
         if (!created) {
           const pinnedExhausted = accountId ? this.database.getAccount(accountId)?.dailyQuotaExhausted : false;
@@ -188,12 +199,15 @@ class LocalApiServer {
             source: body.source,
             model,
             aspectRatio,
+            duration,
+            resolution,
             status: "failed",
             message: pinnedExhausted ? "豆包今日免费次数已用完；本任务指定了账号，不自动换号" : accountId ? "指定账号未登录、不存在或该模型剩余额度不足" : "没有可用账号，或该模型剩余额度不足",
             accountId: pinnedExhausted ? accountId : undefined,
             requestedAccountId: accountId,
             prompt,
             referenceImagePath,
+            referenceImagePaths,
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
@@ -567,7 +581,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
   if (!boundary) throw new Error("multipart boundary is required");
 
   const fields: Record<string, string> = {};
-  let uploadedReferenceImagePath: string | null = null;
+  const uploadedReferenceImagePaths: string[] = [];
   const delimiter = Buffer.from(`--${boundary}`);
 
   for (const rawPart of splitBuffer(buffer, delimiter)) {
@@ -586,14 +600,15 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     if (!disposition.name) continue;
 
     if (disposition.filename) {
-      if (!uploadedReferenceImagePath && body.length > 0) {
-        uploadedReferenceImagePath = await saveUploadedFile({
+      if (["referenceImages", "referenceImage"].includes(disposition.name) && body.length > 0) {
+        if (uploadedReferenceImagePaths.length >= 9) throw new Error("a maximum of 9 reference images is supported");
+        uploadedReferenceImagePaths.push(await saveUploadedFile({
           requestId,
-          fieldName: disposition.name,
+          fieldName: `reference-${uploadedReferenceImagePaths.length + 1}`,
           filename: disposition.filename,
           contentType: headers["content-type"],
           bytes: body
-        });
+        }));
       }
       continue;
     }
@@ -605,8 +620,11 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     accountId: fields.accountId,
     model: fields.model as DoubaoModel | undefined,
     aspectRatio: fields.aspectRatio || null,
+    duration: fields.duration || undefined,
+    resolution: fields.resolution || undefined,
     prompt: fields.prompt || "",
-    referenceImagePath: uploadedReferenceImagePath || fields.referenceImagePath || null,
+    referenceImagePath: uploadedReferenceImagePaths[0] || fields.referenceImagePath || null,
+    referenceImagePaths: uploadedReferenceImagePaths,
     referenceImageUrl: fields.referenceImageUrl || null,
     removeWatermark: parseOptionalBoolean(fields.removeWatermark),
     callbackUrl: fields.callbackUrl || null,
@@ -614,24 +632,39 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
   };
 }
 
-async function prepareReferenceImage(body: GenerateRequestBody, requestId: string) {
-  if (body.referenceImagePath?.trim()) return body.referenceImagePath.trim();
-  const imageUrl = body.referenceImageUrl?.trim();
-  if (!imageUrl) return null;
+async function prepareReferenceImages(body: GenerateRequestBody, requestId: string) {
+  const inputs = [
+    ...(Array.isArray(body.referenceImages) ? body.referenceImages : []),
+    ...(Array.isArray(body.referenceImagePaths) ? body.referenceImagePaths : []),
+    ...(body.referenceImagePath ? [body.referenceImagePath] : []),
+    ...(body.referenceImageUrl ? [body.referenceImageUrl] : [])
+  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const unique = [...new Set(inputs.map(value => value.trim()))];
+  if (unique.length > 9) throw new Error("a maximum of 9 reference images is supported");
 
-  const response = await fetch(imageUrl);
-  if (!response.ok) {
-    throw new Error(`参考图下载失败：HTTP ${response.status}`);
+  const prepared: string[] = [];
+  for (let index = 0; index < unique.length; index += 1) {
+    const value = unique[index];
+    if (!/^https?:\/\//i.test(value)) {
+      const resolved = path.resolve(value);
+      const stat = await fs.stat(resolved).catch(() => null);
+      if (!stat?.isFile()) throw new Error(`参考图不存在：${resolved}`);
+      prepared.push(resolved);
+      continue;
+    }
+
+    const response = await fetch(value);
+    if (!response.ok) throw new Error(`参考图下载失败（${index + 1}）：HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type") || "";
+    const urlExt = path.extname(new URL(value).pathname);
+    const ext = urlExt || extensionFromContentType(contentType) || ".png";
+    const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
+    await fs.mkdir(uploadDir, { recursive: true });
+    const imagePath = path.join(uploadDir, `${requestId}-reference-${index + 1}${ext}`);
+    await fs.writeFile(imagePath, Buffer.from(await response.arrayBuffer()));
+    prepared.push(imagePath);
   }
-
-  const contentType = response.headers.get("content-type") || "";
-  const urlExt = path.extname(new URL(imageUrl).pathname);
-  const ext = urlExt || extensionFromContentType(contentType) || ".png";
-  const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
-  await fs.mkdir(uploadDir, { recursive: true });
-  const imagePath = path.join(uploadDir, `${requestId}-reference${ext}`);
-  await fs.writeFile(imagePath, Buffer.from(await response.arrayBuffer()));
-  return imagePath;
+  return prepared;
 }
 
 async function saveUploadedFile(input: {
