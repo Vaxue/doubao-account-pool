@@ -409,13 +409,96 @@ async function detectAllLoginStatuses() {
   return db.listAccounts();
 }
 
+function accountPartitionDir(partition: string) {
+  return path.join(app.getPath("userData"), "Partitions", partition.replace(/^persist:/, ""));
+}
+
+async function closePartitionWindows(partition: string) {
+  const target = session.fromPartition(partition);
+  const windows = BrowserWindow.getAllWindows().filter(
+    (win) => !win.isDestroyed() && win.webContents.session === target
+  );
+  for (const win of windows) {
+    await new Promise<void>((resolve) => {
+      win.once("closed", () => resolve());
+      win.destroy();
+    });
+  }
+}
+
+/**
+ * 彻底清空某个账号的浏览器数据：关闭窗口 -> 清 storage/cache/认证缓存 -> 断开连接 -> 删目录。
+ * 只调用 clearStorageData 会留下 Partitions/<partition> 目录和残留文件，
+ * 旧实现删号后再加号会复用同一编号，新账号直接继承这些脏数据。
+ */
+async function purgeAccountPartition(partition: string, reason: string) {
+  await closePartitionWindows(partition);
+  const accountSession = session.fromPartition(partition);
+  await accountSession.clearStorageData().catch(() => undefined);
+  await accountSession.clearCache().catch(() => undefined);
+  await accountSession.clearAuthCache().catch(() => undefined);
+  try {
+    accountSession.closeAllConnections();
+  } catch {
+    // 旧版本 Electron 没有该 API 时忽略
+  }
+
+  const dir = accountPartitionDir(partition);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      log.info(`[account] 已清理浏览器数据目录 ${dir}（${reason}）`);
+      return true;
+    } catch (error) {
+      if (attempt === 4) {
+        log.error(`[account] 清理浏览器数据目录失败 ${dir}`, error);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  return false;
+}
+
+/** 启动时清理没有对应账号的遗留 partition 目录（历史版本删号只删了数据库行）。 */
+async function purgeOrphanAccountPartitions() {
+  const partitionsDir = path.join(app.getPath("userData"), "Partitions");
+  let names: string[];
+  try {
+    names = await fs.readdir(partitionsDir);
+  } catch {
+    return;
+  }
+  const used = new Set(db.listAccounts().map((account) => account.partition.replace(/^persist:/, "")));
+  for (const name of names) {
+    if (!/^doubao_account_\d+$/.test(name) || used.has(name)) continue;
+    const dir = path.join(partitionsDir, name);
+    try {
+      const stat = await fs.stat(dir);
+      // 跳过刚创建、可能还没落库的目录
+      if (Date.now() - stat.mtimeMs < 60_000) continue;
+      await fs.rm(dir, { recursive: true, force: true });
+      log.info(`[account] 已清理无对应账号的浏览器数据目录 ${dir}`);
+    } catch (error) {
+      log.warn(`[account] 清理无主浏览器数据目录失败 ${dir}`, error);
+    }
+  }
+}
+
 async function clearAccountSession(accountId: number) {
   const account = db.getAccount(accountId);
   if (!account) throw new Error("Account not found");
 
+  await closePartitionWindows(account.partition);
   const accountSession = session.fromPartition(account.partition);
   await accountSession.clearStorageData();
   await accountSession.clearCache();
+  await accountSession.clearAuthCache().catch(() => undefined);
+  try {
+    accountSession.closeAllConnections();
+  } catch {
+    // 旧版本 Electron 没有该 API 时忽略
+  }
   return db.updateAccount({
     id: accountId,
     loginStatus: "logged_out",
@@ -437,9 +520,15 @@ function registerIpc() {
   });
   ipcMain.handle("accounts:delete", async (_event, id: number) => {
     const account = db.getAccount(id);
-    await clearAccountSession(id);
+    if (!account) throw new Error("Account not found");
+    if (account.runningTaskCount + account.queuedTaskCount > 0) {
+      throw new Error("账号还有执行或排队任务，请先终止任务再删除");
+    }
+    const purged = await purgeAccountPartition(account.partition, "删除账号");
     db.deleteAccount(id);
-    recordOperation(null, id, "删除账号", "success", `已删除 ${account?.partition || id}`);
+    recordOperation(null, id, "删除账号", "success", purged
+      ? `已删除 ${account.partition}，浏览器数据目录已清空`
+      : `已删除 ${account.partition}，但浏览器数据目录未清理干净，请手动处理`);
     return true;
   });
   ipcMain.handle("accounts:open", (_event, id: number) => {
@@ -776,6 +865,7 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     log.initialize();
     db = new AppDatabase();
+    await purgeOrphanAccountPartitions();
     executor = new DoubaoExecutor(db, notifyDataChanged, observeWatermarkResponse);
     apiServer = new LocalApiServer(db, executor);
     const queuedRequests = db.prepareQueueAfterRestart();

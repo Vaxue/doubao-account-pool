@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { app } from "electron";
@@ -1084,6 +1085,12 @@ export class AppDatabase {
     }
   }
 
+  /**
+   * 账号编号只增不减：已删除账号的 partition 名称、以及 Electron 内存里对应的 session 都不会被新账号复用。
+   * 复用编号会让新账号继承上一个账号残留的浏览器数据（cookie / IndexedDB / localStorage / session 引用），
+   * 典型表现是页面能打开、也能点发送，但消息发不进对话，页面零回复。
+   * 这里同时把磁盘上残留的 partition 目录计入，避免历史遗留目录被重新分配。
+   */
   private nextAccountNumber(): number {
     const rows = this.db.prepare("SELECT partition FROM accounts").all() as Array<{ partition: string }>;
     const used = rows
@@ -1091,9 +1098,17 @@ export class AppDatabase {
       .filter((value): value is string => Boolean(value))
       .map((value) => Number(value));
 
-    let current = 1;
-    while (used.includes(current)) current += 1;
-    return current;
+    let highest = used.reduce((max, value) => Math.max(max, value), 0);
+    try {
+      const partitionsDir = path.join(app.getPath("userData"), "Partitions");
+      for (const name of fs.readdirSync(partitionsDir)) {
+        const match = name.match(/^doubao_account_(\d+)$/);
+        if (match) highest = Math.max(highest, Number(match[1]));
+      }
+    } catch {
+      // 目录不存在或不可读时，按数据库记录编号即可
+    }
+    return highest + 1;
   }
 }
 
