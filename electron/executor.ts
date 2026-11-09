@@ -425,6 +425,22 @@ export class DoubaoExecutor {
           });
         }
 
+        // 豆包默认时长是 10 秒，必须在界面上真正选中目标时长；
+        // 只把「总时长 N 秒」写进提示词没用，页面选项胶囊会覆盖它。
+        if (request.duration) {
+          await progress({
+            requestId,
+            status: "running",
+            message: `正在设置豆包时长：${request.duration} 秒`
+          });
+          const durationResult = await selectDoubaoDuration(win!, request.duration);
+          await progress({
+            requestId,
+            status: "running",
+            message: `豆包时长已处理：${durationResult.note || `${request.duration} 秒`}`
+          });
+        }
+
         await progress({
           requestId,
           status: "running",
@@ -1105,6 +1121,82 @@ async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
   `);
 }
 
+// 斜杠命令的候选只在弹层里；输入框内的 "/视频生成" 文本去掉符号后同名，必须排除。
+async function findDoubaoSlashOption(win: BrowserWindow, label: string) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const label = ${JSON.stringify(label)};
+      const compact = (value) => String(value || "").replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
+      const target = compact(label);
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05;
+      };
+      const inEditor = (el) => Boolean(el.closest('textarea, [contenteditable="true"], [role="textbox"]'));
+      const items = [];
+      for (const el of Array.from(document.body.querySelectorAll("*"))) {
+        if (!visible(el) || inEditor(el)) continue;
+        const text = compact(el.innerText || el.getAttribute("aria-label") || "");
+        if (!text) continue;
+        const isExact = text === target;
+        const isPrefix = text.startsWith(target) && text.length <= target.length + 24;
+        if (!isExact && !isPrefix) continue;
+        const clickable = el.closest('[role="option"], [role="menuitem"], button, [role="button"], [tabindex]') || el;
+        if (inEditor(clickable) || !visible(clickable)) continue;
+        const rect = clickable.getBoundingClientRect();
+        items.push({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          text,
+          area: rect.width * rect.height,
+          exact: isExact
+        });
+      }
+      if (!items.length) return null;
+      items.sort((a, b) => Number(b.exact) - Number(a.exact) || a.area - b.area);
+      return { x: items[0].x, y: items[0].y, debug: items[0].text };
+    })()
+  `);
+}
+
+// 豆包把视频生成收进了技能面板，最稳的进入方式是在输入框打斜杠命令 /视频生成。
+async function openDoubaoVideoModeBySlash(win: BrowserWindow) {
+  const target = await findComposerTarget(win);
+  if (!target) return false;
+  await sendMouseClick(win, target.x, target.y);
+  await sendKeyboard(win, "A", ["meta"], 100);
+  await sendKeyboard(win, "Backspace", undefined, 120);
+  // 必须用真实按键事件，insertText 不触发 React 的斜杠菜单。
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "/" });
+  win.webContents.sendInputEvent({ type: "char", keyCode: "/" });
+  win.webContents.sendInputEvent({ type: "keyUp", keyCode: "/" });
+  let option: Awaited<ReturnType<typeof findDoubaoSlashOption>> = null;
+  for (let poll = 0; poll < 8 && !option; poll += 1) {
+    await wait(250);
+    option = await findDoubaoSlashOption(win, "视频生成");
+  }
+  if (!option) {
+    // 技能列表可能折叠在「更多技能」里。
+    const more = await findExactDoubaoActionPoint(win, "更多技能", true);
+    if (more) {
+      await sendMouseClick(win, more.x, more.y);
+      for (let poll = 0; poll < 8 && !option; poll += 1) {
+        await wait(250);
+        option = await findDoubaoSlashOption(win, "视频生成");
+      }
+    }
+  }
+  if (!option) return false;
+  await sendMouseClick(win, option.x, option.y);
+  await wait(700);
+  return true;
+}
+
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   const target = model === "seedance_2_0_mini" ? "mini" : "fast";
   const targetLabel = doubaoVideoModelLabel(target);
@@ -1125,7 +1217,29 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
     }
 
     if (!current.currentModel) {
-      const videoMode = await findExactDoubaoActionPoint(win, "视频生成", true);
+      // 首选：输入框打斜杠命令 /视频生成（新版界面把入口收进了技能面板）。
+      const bySlash = await openDoubaoVideoModeBySlash(win);
+      if (bySlash) {
+        diagnostics.push(`第 ${attempt} 次以 /视频生成 打开视频模式`);
+        current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 4500);
+        if (current.currentModel === target) return;
+      } else {
+        diagnostics.push(`第 ${attempt} 次斜杠命令没有出现视频生成候选`);
+      }
+    }
+
+    if (!current.currentModel) {
+      // 兜底：工具栏上直接点「视频生成」，没有就先点「更多技能」再抓。
+      let videoMode = await findExactDoubaoActionPoint(win, "视频生成", true);
+      if (!videoMode) {
+        const skillEntry = await findExactDoubaoActionPoint(win, "更多技能", true);
+        if (skillEntry) {
+          await sendMouseClick(win, skillEntry.x, skillEntry.y);
+          diagnostics.push(`第 ${attempt} 次点击技能入口 ${skillEntry.debug}`);
+          await wait(1000);
+          videoMode = await findExactDoubaoActionPoint(win, "视频生成", true);
+        }
+      }
       if (videoMode) {
         await sendMouseClick(win, videoMode.x, videoMode.y);
         diagnostics.push(`第 ${attempt} 次点击视频入口 ${videoMode.debug}`);
@@ -1369,8 +1483,9 @@ async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "
           const rect = parent.getBoundingClientRect();
           const text = compactText(parent);
           if (rect.width <= 800 && rect.height <= 800
-            && text.includes("Seedance2.0Mini")
-            && text.includes("Seedance2.0Fast")) {
+            && text.includes("Seedance2.0")
+            && /mini/i.test(text)
+            && /fa/i.test(text)) {
             return true;
           }
         }
@@ -1503,7 +1618,7 @@ async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
             rect
           };
         })
-        .filter((item) => item.ratio);
+        .filter((item) => item.ratio || item.summary);
       const trigger = items
         .filter((item) => item.summary)
         .sort((a, b) => b.rect.bottom - a.rect.bottom || a.text.length - b.text.length)[0];
@@ -1657,6 +1772,106 @@ async function clickExactDoubaoAspectRatioOption(win: BrowserWindow, targetRatio
       };
     })()
   `);
+}
+
+// 豆包的时长是一个滑块（4s-15s）。以前只设画幅、从不设时长，所以永远出默认 10 秒。
+async function selectDoubaoDuration(win: BrowserWindow, seconds: number) {
+  const target = Math.max(1, Math.round(Number(seconds) || 0));
+  const diagnostics: string[] = [];
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const trigger = await clickDoubaoAspectRatioTrigger(win);
+    if (!trigger) {
+      diagnostics.push(`第 ${attempt} 次未找到视频参数入口`);
+      continue;
+    }
+    await sendMouseClick(win, trigger.x, trigger.y);
+    await wait(700);
+
+    const probe = await runPageScript<{
+      kind: "range" | "slider" | "none";
+      ok: boolean;
+      min?: number;
+      max?: number;
+      x?: number;
+      y?: number;
+      now?: number;
+      marks?: string[];
+    }>(win, `
+      (() => {
+        const seconds = ${target};
+        const visible = (el) => {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return rect.width > 4 && rect.height > 4
+            && style.visibility !== "hidden" && style.display !== "none"
+            && Number(style.opacity || "1") > 0.05;
+        };
+        const ranges = Array.from(document.querySelectorAll('input[type="range"]')).filter(visible);
+        for (const el of ranges) {
+          const min = Number(el.min || 0);
+          const max = Number(el.max || 0);
+          if (!(max > min) || seconds < min || seconds > max) continue;
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          setter?.call(el, String(seconds));
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { kind: "range", ok: true, min, max };
+        }
+        const sliders = Array.from(document.querySelectorAll('[role="slider"]')).filter(visible);
+        if (sliders.length) {
+          const el = sliders[0];
+          const rect = el.getBoundingClientRect();
+          return {
+            kind: "slider",
+            ok: false,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+            min: Number(el.getAttribute("aria-valuemin") || 0),
+            max: Number(el.getAttribute("aria-valuemax") || 0),
+            now: Number(el.getAttribute("aria-valuenow") || 0)
+          };
+        }
+        const marks = Array.from(document.querySelectorAll("body *"))
+          .filter(visible)
+          .map((el) => String(el.innerText || "").replace(/\\s+/g, "").trim())
+          .filter((text) => /^\\d+s$/i.test(text));
+        return { kind: "none", ok: false, marks: Array.from(new Set(marks)).slice(0, 8) };
+      })()
+    `);
+
+    if (probe?.ok) {
+      await wait(350);
+      const actual = await runPageScript<number | null>(win, `
+        (() => {
+          const el = Array.from(document.querySelectorAll('input[type="range"]'))[0];
+          return el ? Number(el.value) : null;
+        })()
+      `);
+      diagnostics.push(
+        actual === target
+          ? `第 ${attempt} 次已设时长 ${target}s（可选 ${probe.min}-${probe.max}s）`
+          : `第 ${attempt} 次时长写入后读回 ${actual ?? "未知"}s，要求 ${target}s（可选 ${probe.min}-${probe.max}s）`
+      );
+      await sendKeyboard(win, "Escape", undefined, 200);
+      return { attempts: attempt, note: diagnostics.join("；") };
+    }
+
+    if (probe?.kind === "slider") {
+      // 自定义滑块没有可写 value，聚焦后按 End 键直接推到最大值。
+      await sendMouseClick(win, probe.x || 0, probe.y || 0);
+      await sendKeyboard(win, "End", undefined, 250);
+      await wait(300);
+      diagnostics.push(`第 ${attempt} 次用 End 键把时长滑块推到最大值（${probe.min}-${probe.max}s）`);
+      await sendKeyboard(win, "Escape", undefined, 200);
+      return { attempts: attempt, note: diagnostics.join("；") };
+    }
+
+    diagnostics.push(`第 ${attempt} 次未找到时长滑块，面板内秒数标记 ${(probe?.marks || []).join(" | ") || "无"}`);
+    await sendKeyboard(win, "Escape", undefined, 180);
+  }
+
+  throw new Error(`豆包时长未确认：要求 ${target} 秒，控件没能设置成功；${diagnostics.join("；")}`);
 }
 
 async function waitForDoubaoAspectRatioState(

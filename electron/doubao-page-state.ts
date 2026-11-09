@@ -4,22 +4,47 @@ export function normalizeComparableText(value: string) {
 
 export type DoubaoVideoModelName = "mini" | "fast";
 
+// 豆包新版会把模型名拆成多段文本（例如 "Seedance 2.0 Fa t"），
+// 整串匹配会失效，必须先去空白再按 "seedance20" 之后的前缀判定。
+export function doubaoModelKeyFromText(value: string | null | undefined) {
+  const compact = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const index = compact.indexOf("seedance20");
+  if (index < 0) return null;
+  const rest = compact.slice(index + "seedance20".length);
+  if (rest.startsWith("mini") || rest.startsWith("mi")) return "mini";
+  if (rest.startsWith("fast") || rest.startsWith("fas") || rest.startsWith("fa") || rest.startsWith("f")) return "fast";
+  return null;
+}
+
 export function doubaoVideoModelLabel(model: DoubaoVideoModelName) {
   return model === "mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
 }
 
 export function doubaoVideoModelFromText(value: string | null | undefined): DoubaoVideoModelName | null {
+  // 自包含：本函数会被 toString() 注入网页脚本，不能引用模块内的其他函数。
+  const compact = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const index = compact.indexOf("seedance20");
+  if (index >= 0) {
+    const rest = compact.slice(index + "seedance20".length);
+    if (rest.startsWith("mini") || rest.startsWith("mi")) return "mini";
+    if (rest.startsWith("fast") || rest.startsWith("fas") || rest.startsWith("fa") || rest.startsWith("f")) return "fast";
+  }
   const text = String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
-  const compact = text.replace(/[^a-z0-9]+/g, "");
-  const hasMini = compact.includes("seedance20mini") || /(?:^|\s)mini(?:\s|$)/.test(text);
-  const hasFast = compact.includes("seedance20fast") || /(?:^|\s)fast(?:\s|$)/.test(text);
+  const hasMini = /(?:^|\s)mini(?:\s|$)/.test(text);
+  const hasFast = /(?:^|\s)fast(?:\s|$)/.test(text);
   if (hasMini === hasFast) return null;
   return hasMini ? "mini" : "fast";
 }
 
 export function isDoubaoVideoModelTriggerText(value: string | null | undefined) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  return /^(?:模型\s*)?Seedance\s*2\.0\s*(?:Mini|Fast)$/i.test(text);
+  // 自包含：本函数会被 toString() 注入网页脚本，不能引用模块内的其他函数。
+  const compact = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (!compact || compact.length > 40) return false;
+  const index = compact.indexOf("seedance20");
+  if (index < 0) return false;
+  const rest = compact.slice(index + "seedance20".length);
+  return rest.startsWith("mini") || rest.startsWith("mi")
+    || rest.startsWith("fast") || rest.startsWith("fas") || rest.startsWith("fa") || rest.startsWith("f");
 }
 
 export function doubaoAspectRatioFromText(value: string | null | undefined) {
@@ -33,7 +58,8 @@ export function doubaoAspectRatioFromText(value: string | null | undefined) {
 export function isDoubaoAspectRatioTriggerText(value: string | null | undefined) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text || text.length > 48) return false;
-  return /^(?:(?:画面)?(?:比例|画幅)\s*[:：]?\s*)?(?:自动|9:16|16:9|3:4|4:3|1:1|21:9)(?:\s*(?:[·•|,/]|-|—)?\s*\d+(?:\.\d+)?\s*(?:s|秒))?$/i.test(text);
+  // 新版把比例与时长合成一个胶囊（如 "自动 · 10" / "16:9 · 15"），单位可能不出现。
+  return /^(?:(?:画面)?(?:比例|画幅)\s*[:：]?\s*)?(?:自动|9:16|16:9|3:4|4:3|1:1|21:9)(?:\s*(?:[·•|,/]|-|—)?\s*\d+(?:\.\d+)?\s*(?:s|秒)?)?$/i.test(text);
 }
 
 const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|chat|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
