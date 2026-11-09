@@ -2,6 +2,7 @@ node_modules/
 dist/
 dist-electron/
 release/
+release-*/
 outputs/
 coverage/
 test-results/
