@@ -116,6 +116,7 @@ export class AppDatabase {
         prompt TEXT NOT NULL,
         reference_image_path TEXT,
         reference_image_paths TEXT NOT NULL DEFAULT '[]',
+        reference_video_paths TEXT NOT NULL DEFAULT '[]',
         remove_watermark INTEGER NOT NULL DEFAULT 1,
         callback_url TEXT,
         doubao_thread_url TEXT,
@@ -606,6 +607,7 @@ export class AppDatabase {
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
         api_requests.reference_image_paths AS referenceImagePathsJson,
+        api_requests.reference_video_paths AS referenceVideoPathsJson,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -645,6 +647,14 @@ export class AppDatabase {
     return Number(row.count || 0);
   }
 
+  /** 已被其他任务占用的豆包对话地址；提交前用来避免把旧对话当成本次对话。 */
+  listUsedConversationUrls(excludeRequestId: string): string[] {
+    const rows = this.db
+      .prepare("SELECT DISTINCT source_conversation_url AS u FROM api_requests WHERE source_conversation_url IS NOT NULL AND source_conversation_url <> '' AND request_id <> ?")
+      .all(excludeRequestId) as Array<{ u: string | null }>;
+    return rows.map((row) => row.u).filter((value): value is string => typeof value === "string" && value.length > 0);
+  }
+
   getApiRequest(requestId: string): ApiRequest | undefined {
     const row = this.db.prepare(`
       SELECT
@@ -667,6 +677,7 @@ export class AppDatabase {
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
         api_requests.reference_image_paths AS referenceImagePathsJson,
+        api_requests.reference_video_paths AS referenceVideoPathsJson,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -707,6 +718,7 @@ export class AppDatabase {
         prompt,
         reference_image_path,
         reference_image_paths,
+        reference_video_paths,
         remove_watermark,
         callback_url,
         quota_cost,
@@ -717,7 +729,7 @@ export class AppDatabase {
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
@@ -732,6 +744,7 @@ export class AppDatabase {
       input.prompt,
       input.referenceImagePath || null,
       JSON.stringify(input.referenceImagePaths || (input.referenceImagePath ? [input.referenceImagePath] : [])),
+      JSON.stringify(input.referenceVideoPaths || []),
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
       quotaAmount(input.quotaCost || 0),
@@ -1038,6 +1051,7 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "resolution", "TEXT NOT NULL DEFAULT '720p'");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
     this.addColumnIfMissing("api_requests", "reference_image_paths", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing("api_requests", "reference_video_paths", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
     this.addColumnIfMissing("api_requests", "doubao_thread_url", "TEXT");
@@ -1145,22 +1159,29 @@ function normalizeApiRequest(row: unknown): ApiRequest {
     quotaRefunded: number | boolean;
     errorJson: string | null;
     referenceImagePathsJson?: string | null;
+    referenceVideoPathsJson?: string | null;
   };
   let error = null;
   if (request.status === "failed") {
     try { error = request.errorJson ? JSON.parse(request.errorJson) : diagnoseRequest(request.message); }
     catch { error = diagnoseRequest(request.message); }
   }
-  const { errorJson: _errorJson, referenceImagePathsJson, ...values } = request;
+  const { errorJson: _errorJson, referenceImagePathsJson, referenceVideoPathsJson, ...values } = request;
   let referenceImagePaths: string[] = [];
   try {
     const parsed = referenceImagePathsJson ? JSON.parse(referenceImagePathsJson) : [];
     if (Array.isArray(parsed)) referenceImagePaths = parsed.filter((item): item is string => typeof item === "string");
   } catch { /* legacy or malformed rows fall back to the single-image column */ }
   if (referenceImagePaths.length === 0 && request.referenceImagePath) referenceImagePaths = [request.referenceImagePath];
+  let referenceVideoPaths: string[] = [];
+  try {
+    const parsed = referenceVideoPathsJson ? JSON.parse(referenceVideoPathsJson) : [];
+    if (Array.isArray(parsed)) referenceVideoPaths = parsed.filter((item): item is string => typeof item === "string");
+  } catch { /* legacy or malformed rows fall back to no video reference */ }
   return {
     ...values,
     referenceImagePaths,
+    referenceVideoPaths,
     aspectRatio: request.aspectRatio === "9:16" || request.aspectRatio === "16:9" ? request.aspectRatio : "16:9",
     duration: Number.isInteger(request.duration) && request.duration >= 4 && request.duration <= 15 ? request.duration : 15,
     resolution: request.resolution === "1080p" ? "1080p" : "720p",

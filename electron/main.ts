@@ -188,9 +188,10 @@ class LocalApiServer {
         }
         const referenceImagePaths = await prepareReferenceImages(body, requestId);
         const referenceImagePath = referenceImagePaths[0] || null;
+        const referenceVideoPaths = await prepareReferenceVideos(body, requestId);
         refreshQuotas();
         const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio, duration, resolution,
-          prompt, referenceImagePath, referenceImagePaths, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
+          prompt, referenceImagePath, referenceImagePaths, referenceVideoPaths, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
 
         if (!created) {
           const pinnedExhausted = accountId ? this.database.getAccount(accountId)?.dailyQuotaExhausted : false;
@@ -208,6 +209,7 @@ class LocalApiServer {
             prompt,
             referenceImagePath,
             referenceImagePaths,
+            referenceVideoPaths,
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
@@ -671,6 +673,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
 
   const fields: Record<string, string> = {};
   const uploadedReferenceImagePaths: string[] = [];
+  const uploadedReferenceVideoPaths: string[] = [];
   const delimiter = Buffer.from(`--${boundary}`);
 
   for (const rawPart of splitBuffer(buffer, delimiter)) {
@@ -699,6 +702,16 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
           bytes: body
         }));
       }
+      if (["referenceVideos", "referenceVideo"].includes(disposition.name) && body.length > 0) {
+        if (uploadedReferenceVideoPaths.length >= 3) throw new Error("a maximum of 3 reference videos is supported");
+        uploadedReferenceVideoPaths.push(await saveUploadedFile({
+          requestId,
+          fieldName: `reference-video-${uploadedReferenceVideoPaths.length + 1}`,
+          filename: disposition.filename,
+          contentType: headers["content-type"],
+          bytes: body
+        }));
+      }
       continue;
     }
 
@@ -714,6 +727,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     prompt: fields.prompt || "",
     referenceImagePath: uploadedReferenceImagePaths[0] || fields.referenceImagePath || null,
     referenceImagePaths: uploadedReferenceImagePaths,
+    referenceVideoPaths: uploadedReferenceVideoPaths,
     referenceImageUrl: fields.referenceImageUrl || null,
     removeWatermark: parseOptionalBoolean(fields.removeWatermark),
     callbackUrl: fields.callbackUrl || null,
@@ -752,6 +766,39 @@ async function prepareReferenceImages(body: GenerateRequestBody, requestId: stri
     const imagePath = path.join(uploadDir, `${requestId}-reference-${index + 1}${ext}`);
     await fs.writeFile(imagePath, Buffer.from(await response.arrayBuffer()));
     prepared.push(imagePath);
+  }
+  return prepared;
+}
+
+async function prepareReferenceVideos(body: GenerateRequestBody, requestId: string) {
+  const inputs = [
+    ...(Array.isArray(body.referenceVideoPaths) ? body.referenceVideoPaths : []),
+    ...(body.referenceVideoPath ? [body.referenceVideoPath] : [])
+  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const unique = [...new Set(inputs.map(value => value.trim()))];
+  if (unique.length > 3) throw new Error("a maximum of 3 reference videos is supported");
+
+  const prepared: string[] = [];
+  for (let index = 0; index < unique.length; index += 1) {
+    const value = unique[index];
+    if (!/^https?:\/\//i.test(value)) {
+      const resolved = path.resolve(value);
+      const stat = await fs.stat(resolved).catch(() => null);
+      if (!stat?.isFile()) throw new Error(`参考视频不存在：${resolved}`);
+      prepared.push(resolved);
+      continue;
+    }
+
+    const response = await fetch(value);
+    if (!response.ok) throw new Error(`参考视频下载失败（${index + 1}）：HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type") || "";
+    const urlExt = path.extname(new URL(value).pathname);
+    const ext = urlExt || (contentType.includes("quicktime") ? ".mov" : ".mp4");
+    const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
+    await fs.mkdir(uploadDir, { recursive: true });
+    const videoPath = path.join(uploadDir, `${requestId}-reference-video-${index + 1}${ext}`);
+    await fs.writeFile(videoPath, Buffer.from(await response.arrayBuffer()));
+    prepared.push(videoPath);
   }
   return prepared;
 }

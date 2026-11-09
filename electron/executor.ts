@@ -434,13 +434,36 @@ export class DoubaoExecutor {
         const referenceImagePaths = request.referenceImagePaths.length
           ? request.referenceImagePaths
           : request.referenceImagePath ? [request.referenceImagePath] : [];
-        if (referenceImagePaths.length) {
+        const referenceVideoPaths = request.referenceVideoPaths ?? [];
+        const mediaPaths = [...referenceImagePaths, ...referenceVideoPaths];
+        if (mediaPaths.length) {
+          const mediaSummary = [
+            referenceImagePaths.length ? `${referenceImagePaths.length} 张参考图` : "",
+            referenceVideoPaths.length ? `${referenceVideoPaths.length} 段参考视频` : ""
+          ].filter(Boolean).join("、");
           await progress({
             requestId,
             status: "running",
-            message: attempt === 1 ? `正在上传 ${referenceImagePaths.length} 张参考图` : `正在重新上传 ${referenceImagePaths.length} 张参考图`
+            message: attempt === 1 ? `正在上传 ${mediaSummary}` : `正在重新上传 ${mediaSummary}`
           });
-          await uploadReferenceImages(win!, referenceImagePaths);
+          await uploadReferenceMedia(win!, mediaPaths);
+          // 豆包在接收参考素材后会把输入框边的模式胶囊重置回普通对话，
+          // 导致后面的"发送前模型校验"直接失败、消息被打红叹号。
+          const requestedAfterUpload = request.model === "seedance_2_0_mini" ? "mini" : "fast";
+          const afterUpload = await inspectSelectedVideoModel(win!);
+          if (afterUpload.currentModel !== requestedAfterUpload) {
+            await progress({
+              requestId,
+              status: "running",
+              message: "参考素材上传后视频模式被重置，正在恢复视频生成模式"
+            });
+            await activateVideoMode(win!, request.model);
+            await wait(800);
+            const recovered = await inspectSelectedVideoModel(win!);
+            if (recovered.currentModel !== requestedAfterUpload) {
+              throw new Error(`参考素材上传后无法恢复视频生成模式：要求 ${doubaoVideoModelLabel(requestedAfterUpload)}，当前为 ${recovered.currentModel ? doubaoVideoModelLabel(recovered.currentModel) : "未识别"}`);
+            }
+          }
         }
 
         await progress({
@@ -511,7 +534,14 @@ export class DoubaoExecutor {
       }
       submittedToDoubao = true;
       this.database.markGenerationAccepted(requestId, request.assignmentRevision);
-      const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
+      const takenConversationUrls = (() => {
+        try {
+          return this.database.listUsedConversationUrls(requestId);
+        } catch {
+          return [];
+        }
+      })();
+      const submittedConversationUrl = await waitForSubmittedConversationUrl(win, takenConversationUrls);
       if (!submittedConversationUrl) throw new DoubaoGenerationPendingError("已识别豆包受理，但未取得准确对话地址；已暂停自动提交以避免串单");
       if (submittedConversationUrl) {
         await progress({
@@ -845,29 +875,56 @@ async function looksLoggedOut(win: BrowserWindow) {
   `);
 }
 
-async function uploadReferenceImages(win: BrowserWindow, imagePaths: string[]) {
+// 九图模式下参考素材动辄几十 MB，固定等 2.5 秒会在文件还没传完时就提交，
+// 豆包会当成空提交，之后再怎么补发"确认生成"也起不来任务。
+// 这里按文件体量给足上传时间，并轮询页面"上传中/百分比"是否消失。
+async function waitForReferenceImagesReady(win: BrowserWindow, filePaths: string[], timeoutMs = 90000) {
+  let totalBytes = 0;
+  for (const filePath of filePaths) {
+    const stat = await fs.stat(filePath).catch(() => null);
+    if (stat?.isFile()) totalBytes += stat.size;
+  }
+  const estimateMs = Math.min(45000, Math.max(3000, Math.round((totalBytes / (4 * 1024 * 1024)) * 1000)));
+  const startedAt = Date.now();
+  let quietTicks = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    const stillUploading = await runPageScript<boolean>(win, `
+      (() => {
+        const text = document.body?.innerText || "";
+        return /上传中|正在上传/.test(text) || /(^|[^0-9])\\d{1,3}%/.test(text);
+      })()
+    `).catch(() => false);
+    if (stillUploading) quietTicks = 0;
+    else quietTicks += 1;
+    if (Date.now() - startedAt >= estimateMs && quietTicks >= 2) return true;
+    await wait(500);
+  }
+  return false;
+}
+
+async function uploadReferenceMedia(win: BrowserWindow, mediaPaths: string[]) {
   const resolvedPaths: string[] = [];
-  for (const imagePath of imagePaths) {
-    const resolvedPath = path.resolve(imagePath);
+  for (const mediaPath of mediaPaths) {
+    const resolvedPath = path.resolve(mediaPath);
     const stat = await fs.stat(resolvedPath).catch(() => null);
-    if (!stat?.isFile()) throw new Error(`参考图不存在：${resolvedPath}`);
+    if (!stat?.isFile()) throw new Error(`参考素材不存在：${resolvedPath}`);
     resolvedPaths.push(resolvedPath);
   }
 
   if (await setFileInputFiles(win, resolvedPaths)) {
-    await wait(2500);
+    await waitForReferenceImagesReady(win, resolvedPaths);
     return;
   }
 
-  await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
+  await clickByKeywords(win, ["上传", "参考图", "参考视频", "图片", "视频", "添加图片", "附件", "image", "upload"]);
   await wait(1200);
 
   if (await setFileInputFiles(win, resolvedPaths)) {
-    await wait(2500);
+    await waitForReferenceImagesReady(win, resolvedPaths);
     return;
   }
 
-  throw new Error("没有找到豆包页面的图片上传控件");
+  throw new Error("没有找到豆包页面的参考素材上传控件");
 }
 
 async function setFileInputFiles(win: BrowserWindow, filePaths: string[]) {
@@ -887,8 +944,26 @@ async function setFileInputFiles(win: BrowserWindow, filePaths: string[]) {
     }) as { nodeIds: number[] };
 
     if (!inputs.nodeIds.length) return false;
+
+    // 视频生成模式会额外插入一个媒体上传框，accept 同时含图片与视频扩展名；
+    // 普通对话输入框只收文档，不能把参考图/参考视频塞给它。
+    const scored: Array<{ nodeId: number; score: number }> = [];
+    for (const nodeId of inputs.nodeIds) {
+      const { attributes } = await debug.sendCommand("DOM.getAttributes", { nodeId }) as {
+        attributes: string[];
+      };
+      const acceptIndex = attributes.findIndex((value) => value === "accept");
+      const accept = acceptIndex >= 0 ? String(attributes[acceptIndex + 1] || "") : "";
+      const hasImage = /image\/|\\.jpe?g|\\.png|\\.webp|\\.apng/i.test(accept);
+      const hasVideo = /video\/|\\.mp4|\\.mov|\\.webm|\\.m4v/i.test(accept);
+      const score = (hasImage ? 2 : 0) + (hasVideo ? 4 : 0);
+      scored.push({ nodeId, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const target = scored[0];
+
     await debug.sendCommand("DOM.setFileInputFiles", {
-      nodeId: inputs.nodeIds[0],
+      nodeId: target.nodeId,
       files: filePaths
     });
     return true;
@@ -3631,15 +3706,22 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
   `);
 }
 
-async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 8000) {
-  let conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
+async function waitForSubmittedConversationUrl(win: BrowserWindow, excludeUrls: string[] = [], timeoutMs = 8000) {
+  // 窗口如果本来就停在别的任务的旧对话页上，原实现会把这个旧地址当成本次提交的地址，
+  // 写库时撞到别的 request，整单被判失败（"本次豆包对话已绑定其他任务"）。
+  // 这里只接受"不是其他任务已占用"的地址，旧地址一律继续等新对话跳转。
+  const excluded = new Set((excludeUrls || []).filter(Boolean));
+  const pickFreshUrl = () => {
+    const url = extractDoubaoConversationUrl(win.webContents.getURL());
+    return url && isFormalDoubaoConversationUrl(url) && !excluded.has(url) ? url : null;
+  };
+  let conversationUrl = pickFreshUrl();
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs && !isFormalDoubaoConversationUrl(conversationUrl)) {
+  while (Date.now() - startedAt < timeoutMs && !conversationUrl) {
     await wait(200);
-    const currentUrl = extractDoubaoConversationUrl(win.webContents.getURL());
-    if (currentUrl) conversationUrl = currentUrl;
+    conversationUrl = pickFreshUrl();
   }
-  return isFormalDoubaoConversationUrl(conversationUrl) ? conversationUrl : null;
+  return conversationUrl;
 }
 
 async function findShareIconPoint(win: BrowserWindow) {

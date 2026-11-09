@@ -120,6 +120,7 @@ export interface ApiRequest {
   prompt: string;
   referenceImagePath: string | null;
   referenceImagePaths: string[];
+  referenceVideoPaths: string[];
   removeWatermark: boolean;
   callbackUrl: string | null;
   doubaoThreadUrl: string | null;
@@ -153,6 +154,8 @@ export interface ApiRequestCreateInput {
   prompt: string;
   referenceImagePath?: string | null;
   referenceImagePaths?: string[];
+  referenceVideoPaths?: string[];
+  referenceVideoPath?: string | null;
   removeWatermark?: boolean;
   callbackUrl?: string | null;
   quotaCost?: number;
@@ -218,6 +221,8 @@ export interface GenerateRequestBody {
   referenceImageUrl?: string | null;
   referenceImagePaths?: string[];
   referenceImages?: string[];
+  referenceVideoPaths?: string[];
+  referenceVideoPath?: string | null;
   removeWatermark?: boolean;
   callbackUrl?: string | null;
   source?: string;
