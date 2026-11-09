@@ -363,6 +363,12 @@ function createMainWindow() {
   } else {
     void mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
   }
+
+  // 主窗口关闭后必须清空引用，否则后台服务会一直持有一个已销毁的窗口对象。
+  const created = mainWindow;
+  created.on("closed", () => {
+    if (mainWindow === created) mainWindow = null;
+  });
 }
 
 function createDoubaoWindow(accountId: number) {
@@ -417,13 +423,37 @@ function accountPartitionDir(partition: string) {
 
 async function closePartitionWindows(partition: string) {
   const target = session.fromPartition(partition);
-  const windows = BrowserWindow.getAllWindows().filter(
-    (win) => !win.isDestroyed() && win.webContents.session === target
-  );
+  const windows: BrowserWindow[] = [];
+  for (const win of BrowserWindow.getAllWindows()) {
+    // 窗口可能正在销毁：访问 webContents/session 会抛 "Object has been destroyed"。
+    try {
+      if (win.isDestroyed()) continue;
+      const contents = win.webContents;
+      if (!contents || contents.isDestroyed()) continue;
+      if (contents.session === target) windows.push(win);
+    } catch {
+      // 遍历过程中窗口被关闭，跳过即可
+    }
+  }
   for (const win of windows) {
+    if (win.isDestroyed()) continue;
     await new Promise<void>((resolve) => {
-      win.once("closed", () => resolve());
-      win.destroy();
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        win.removeListener("closed", done);
+        resolve();
+      };
+      // destroy 在特殊状态下可能不触发 closed，加兜底超时避免永久挂起。
+      const timer = setTimeout(done, 2000);
+      win.once("closed", done);
+      try {
+        win.destroy();
+      } catch {
+        done();
+      }
     });
   }
 }
@@ -624,8 +654,24 @@ function refreshQuotas() {
   }
 }
 
+/**
+ * UI 通知属于「尽力而为」的旁路逻辑。
+ * 主窗口被用户关闭后 mainWindow 仍指向已销毁的 BrowserWindow，
+ * 直接 webContents.send 会抛 "Object has been destroyed"，
+ * 而 executor.updateProgress 会同步调用本函数，异常会冒泡成任务失败
+ * （表现为刚入队 8ms 就失败、额度被退回）。
+ * 因此这里既要做存活检查，也要吞掉所有异常，绝不影响后台任务执行。
+ */
 function notifyDataChanged() {
-  mainWindow?.webContents.send("data:changed");
+  try {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return;
+    const contents = win.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    contents.send("data:changed");
+  } catch (error) {
+    log.warn("[ui] 数据变更通知已跳过（主窗口不可用）", error instanceof Error ? error.message : String(error));
+  }
 }
 
 function normalizeModel(model: string): DoubaoModel | null {
@@ -903,7 +949,10 @@ if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createMainWindow();
+      return;
+    }
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
@@ -925,9 +974,12 @@ if (!hasSingleInstanceLock) {
     createMainWindow();
 
     app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
+      // 只看主窗口自身是否存活：执行窗口可能还开着，但主窗口已关时同样需要重建。
+      if (!mainWindow || mainWindow.isDestroyed()) {
         createMainWindow();
+        return;
       }
+      mainWindow.show();
     });
   }).catch((error) => {
     log.error(error);

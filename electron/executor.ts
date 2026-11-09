@@ -96,6 +96,33 @@ class DoubaoTaskStoppedError extends Error {
   }
 }
 
+/** Electron 原生 "Object has been destroyed" 的可读封装，便于定位与自动恢复。 */
+class DoubaoExecutionWindowClosedError extends Error {
+  constructor(message = "豆包执行窗口已关闭（BrowserWindow/webContents 已被销毁），任务未提交") {
+    super(message);
+    this.name = "DoubaoExecutionWindowClosedError";
+  }
+}
+
+function isWindowDestroyedError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /Object has been destroyed|执行窗口已关闭|been destroyed/i.test(message);
+}
+
+function normalizeWindowError(error: unknown) {
+  if (isWindowDestroyedError(error)) return new DoubaoExecutionWindowClosedError();
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function assertWindowAlive(win: BrowserWindow) {
+  try {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) return;
+  } catch {
+    // 访问 webContents 抛错本身就说明窗口已销毁
+  }
+  throw new DoubaoExecutionWindowClosedError();
+}
+
 const SHARE_PANEL_WAIT_MS = 3500;
 const PAGE_SHARE_CAPTURE_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
@@ -112,6 +139,7 @@ export class DoubaoExecutor {
   private readonly providerLimits = new Map<number, number>();
   private readonly retryAt = new Map<string, number>();
   private readonly capacityRetried = new Set<string>();
+  private readonly windowRetried = new Set<string>();
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
@@ -143,7 +171,7 @@ export class DoubaoExecutor {
         } finally {
           this.stoppedRequestIds.delete(item.requestId);
           if (this.executionWindows.get(item.requestId)?.isDestroyed()) this.executionWindows.delete(item.requestId);
-          if (this.database.refreshDailyQuotas() > 0) this.onDataChanged();
+          if (this.database.refreshDailyQuotas() > 0) this.notifyDataChangedSafe();
         }
       },
       (error) => console.error("豆包并行执行器异常", error),
@@ -159,6 +187,27 @@ export class DoubaoExecutor {
           && account?.loginStatus === "logged_in" && account.currentStatus !== "login_required";
       }
     );
+  }
+
+  /**
+   * UI 通知与回调是旁路逻辑，任何异常都不能冒泡进任务主流程。
+   * 历史上 notifyDataChanged 在主窗口关闭后抛 "Object has been destroyed"，
+   * 从 updateProgress 冒泡到 execute 的 catch，把刚入队的任务直接判失败。
+   */
+  private notifyDataChangedSafe() {
+    try {
+      this.onDataChanged();
+    } catch (error) {
+      console.error("[doubao] 数据变更通知失败，已忽略", error);
+    }
+  }
+
+  private closeExecutionWindowQuietly(win: BrowserWindow | null | undefined) {
+    try {
+      if (win && !win.isDestroyed()) win.close();
+    } catch (error) {
+      console.error("[doubao] 关闭执行窗口失败，已忽略", error);
+    }
   }
 
   wake() {
@@ -184,7 +233,7 @@ export class DoubaoExecutor {
     const wasActive = this.scheduler.isActive(requestId);
     this.stoppedRequestIds.add(requestId);
     const win = this.executionWindows.get(requestId);
-    if (win && !win.isDestroyed()) win.close();
+    this.closeExecutionWindowQuietly(win);
 
     const result = this.database.stopApiRequestAndRefund(requestId);
     this.scheduler.cancel(requestId);
@@ -197,7 +246,7 @@ export class DoubaoExecutor {
       status: "success",
       message: result.request.message
     });
-    this.onDataChanged();
+    this.notifyDataChangedSafe();
     void postCallback(result.request);
     if (!wasActive) this.stoppedRequestIds.delete(requestId);
     return result;
@@ -329,7 +378,8 @@ export class DoubaoExecutor {
         outputVideoPath
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
-    } catch (error) {
+    } catch (rawError) {
+      const error = isWindowDestroyedError(rawError) ? new DoubaoExecutionWindowClosedError() : rawError;
       if (error instanceof AssignmentChangedError) return;
       if (this.isStopped(requestId, error)) {
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -341,9 +391,9 @@ export class DoubaoExecutor {
         id: account.id,
         currentStatus: /未登录|登录/.test(message) ? "login_required" : "idle"
       });
-      this.onDataChanged();
+      this.notifyDataChangedSafe();
     } finally {
-      if (win && !win.isDestroyed()) win.close();
+      this.closeExecutionWindowQuietly(win);
     }
   }
 
@@ -516,7 +566,7 @@ export class DoubaoExecutor {
         }
         if (!this.database.ensureRequestQuota(requestId)) {
           await progress({ requestId, status: "accepted", executionPhase: "queued", message: "跨日额度不足，等待新账期额度可用，不会继续提交" });
-          if (!win.isDestroyed()) win.close();
+          this.closeExecutionWindowQuietly(win);
           return "retry";
         }
         try {
@@ -617,16 +667,39 @@ export class DoubaoExecutor {
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
 
       if (settings.autoCloseExecutorWindow) {
-        win.close();
+        this.closeExecutionWindowQuietly(win);
       }
-    } catch (error) {
+    } catch (rawError) {
+      const error = isWindowDestroyedError(rawError) ? new DoubaoExecutionWindowClosedError() : rawError;
       if (error instanceof AssignmentChangedError) return;
       if (this.isStopped(requestId, error)) {
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
         return;
       }
+      // 提交前窗口被销毁（主窗口通知异常、系统回收、用户误关等）：
+      // 自动重建窗口重试一次，不判失败、不退额度、不重复提交。
+      if (error instanceof DoubaoExecutionWindowClosedError
+        && !submittedToDoubao
+        && !this.database.getApiRequest(requestId)?.submissionSentAt
+        && !this.windowRetried.has(requestId)) {
+        this.windowRetried.add(requestId);
+        this.closeExecutionWindowQuietly(win);
+        this.executionWindows.delete(requestId);
+        try {
+          await progress({
+            requestId,
+            status: "accepted",
+            executionPhase: "queued",
+            message: "豆包执行窗口意外关闭，已自动重建窗口并重新排队（未提交，不会重复扣费）"
+          });
+        } catch {
+          return;
+        }
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        return "retry";
+      }
       if (error instanceof DoubaoAccountExhaustedError || error instanceof DoubaoPageFailureError && isDoubaoDailyQuotaExhausted(error.message)) {
-        if (win && !win.isDestroyed()) win.close();
+        this.closeExecutionWindowQuietly(win);
         return this.handleQuotaRejection(request, error instanceof DoubaoAccountExhaustedError ? undefined : error.message);
       }
       if (error instanceof DoubaoGenerationPendingError) {
@@ -637,8 +710,8 @@ export class DoubaoExecutor {
           message: `${error.message}；稍后可手动恢复结果，不会重新提交`
         });
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
-        this.onDataChanged();
-        if (win && !win.isDestroyed()) win.close();
+        this.notifyDataChangedSafe();
+        this.closeExecutionWindowQuietly(win);
         return;
       }
       if (error instanceof DoubaoConcurrencyLimitError && !submittedToDoubao && !this.capacityRetried.has(requestId)) {
@@ -650,7 +723,7 @@ export class DoubaoExecutor {
         await progress({ requestId, status: "accepted", executionPhase: "queued",
           submissionSentAt: null,
           message: `豆包明确限制并发，等待已有任务结束后再尝试；该账号暂按单任务运行。页面原文：${error.message}` });
-        if (win && !win.isDestroyed()) win.close();
+        this.closeExecutionWindowQuietly(win);
         return "retry";
       }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
@@ -662,9 +735,9 @@ export class DoubaoExecutor {
         id: account.id,
         currentStatus: keepWindowOpen ? "login_required" : "idle"
       });
-      this.onDataChanged();
-      if (win && !settings.showExecutorWindow && !keepWindowOpen && !win.isDestroyed()) {
-        win.close();
+      this.notifyDataChangedSafe();
+      if (!settings.showExecutorWindow && !keepWindowOpen) {
+        this.closeExecutionWindowQuietly(win);
       }
     } finally {
       this.database.refreshAccountStatus(account.id);
@@ -685,8 +758,12 @@ export class DoubaoExecutor {
       message: input.message || "",
       targetUrl: input.doubaoThreadUrl || input.rawVideoUrl || input.cleanVideoUrl || null
     });
-    this.onDataChanged();
-    postCallback(updated);
+    this.notifyDataChangedSafe();
+    try {
+      postCallback(updated);
+    } catch (error) {
+      console.error("[doubao] 回调投递失败，已忽略", error);
+    }
     return updated;
   }
 
@@ -696,7 +773,7 @@ export class DoubaoExecutor {
       else if (!this.scheduler.isActive(request.requestId)) this.scheduler.cancel(request.requestId);
       void postCallback(request);
     }
-    this.onDataChanged();
+    this.notifyDataChangedSafe();
   }
 
   private handleQuotaRejection(request: ApiRequest, reason?: string): "retry" | undefined {
@@ -730,7 +807,7 @@ export class DoubaoExecutor {
       message,
       targetUrl
     });
-    this.onDataChanged();
+    this.notifyDataChangedSafe();
   }
 
   private resolveCleanVideoWithProgress(
@@ -830,7 +907,12 @@ export class DoubaoExecutor {
     });
     win.on("page-title-updated", (event) => {
       event.preventDefault();
-      win.setTitle(windowTitle);
+      // 事件回调可能在窗口已销毁后才触发，setTitle 会抛 "Object has been destroyed"。
+      try {
+        if (!win.isDestroyed()) win.setTitle(windowTitle);
+      } catch {
+        // 窗口正在关闭，忽略即可
+      }
     });
     this.executionWindows.set(requestId, win);
     win.once("closed", () => {
@@ -849,12 +931,20 @@ export class DoubaoExecutor {
 }
 
 async function loadUrl(win: BrowserWindow, url: string, timeoutMs = 30000) {
+  assertWindowAlive(win);
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const cleanup = () => {
-      win.webContents.removeListener("did-finish-load", onFinish);
-      win.webContents.removeListener("did-fail-load", onFail);
+      // 窗口在此期间可能已被关闭，移除监听器时不能再抛 "Object has been destroyed"。
+      try {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+          win.webContents.removeListener("did-finish-load", onFinish);
+          win.webContents.removeListener("did-fail-load", onFail);
+        }
+      } catch {
+        // 窗口正在销毁，忽略
+      }
       if (timer) clearTimeout(timer);
     };
     const finish = (callback: () => void) => {
@@ -873,10 +963,14 @@ async function loadUrl(win: BrowserWindow, url: string, timeoutMs = 30000) {
     win.webContents.once("did-fail-load", onFail);
     timer = setTimeout(() => {
       finish(() => reject(new Error(`豆包页面加载超时（${Math.ceil(timeoutMs / 1000)} 秒）`)));
-      if (!win.isDestroyed()) win.webContents.stop();
+      try {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.stop();
+      } catch {
+        // 窗口正在销毁，忽略
+      }
     }, timeoutMs);
     void win.loadURL(url).catch((error) => {
-      finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+      finish(() => reject(normalizeWindowError(error)));
     });
   });
 }
@@ -4059,7 +4153,12 @@ function postCallback(request: ApiRequest) {
 }
 
 async function runPageScript<T>(win: BrowserWindow, script: string) {
-  return win.webContents.executeJavaScript(script, true) as Promise<T>;
+  assertWindowAlive(win);
+  try {
+    return (await win.webContents.executeJavaScript(script, true)) as T;
+  } catch (error) {
+    throw normalizeWindowError(error);
+  }
 }
 
 async function getPageText(win: BrowserWindow) {
