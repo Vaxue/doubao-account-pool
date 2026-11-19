@@ -3,6 +3,7 @@ import path from "node:path";
 import { BrowserWindow, clipboard } from "electron";
 import { AssignmentChangedError, type AppDatabase } from "./database.js";
 import { isDoubaoDailyQuotaExhausted } from "./doubao-quota-state.js";
+import { resolveDoubaoCleanVideo } from "./doubao-clean-video.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
 import {
   extractDoubaoConversationUrl,
@@ -303,21 +304,26 @@ export class DoubaoExecutor {
         await wait(2500);
         await dismissDoubaoDesktopDownloadPrompt(win);
         if (await looksLoggedOut(win)) throw new Error("豆包账号未登录，无法恢复视频结果");
-        recovery = await findGeneratedConversationAndCopyShare(win, promptWithVideoOptions(request), request.sourceConversationUrl || request.doubaoThreadUrl, async (message) => {
+        recovery = await findGeneratedConversationAndCopyShare(win, effectivePrompt(request, account), request.sourceConversationUrl || request.doubaoThreadUrl, async (message) => {
           await progress({ requestId, status: "running", message });
         }, this.database.getOtherBoundConversations(account.id, requestId));
       }
       if (recovery.directVideoUrl && /^https?:\/\//i.test(recovery.directVideoUrl)) {
+        const recoveryThreadUrl = request.sourceConversationUrl || request.doubaoThreadUrl;
+        const cleanVideo = await resolveDoubaoCleanVideo(recoveryThreadUrl || "").catch(() => null);
+        const playbackUrl = cleanVideo?.url || recovery.directVideoUrl;
         const outputVideoPath = settings.outputDir
-          ? await downloadVideoIfNeeded(settings, requestId, recovery.directVideoUrl).catch(() => null)
+          ? await downloadVideoIfNeeded(settings, requestId, playbackUrl).catch(() => null)
           : null;
         await progress({
           requestId,
           status: "success",
-          message: outputVideoPath ? "已恢复豆包视频并保存到本地" : "已恢复豆包返回的视频",
-          doubaoThreadUrl: request.sourceConversationUrl || request.doubaoThreadUrl,
+          message: cleanVideo
+            ? outputVideoPath ? "已恢复豆包无水印原片并保存到本地" : "已恢复豆包无水印原片"
+            : outputVideoPath ? "已恢复豆包视频并保存到本地" : "已恢复豆包返回的视频",
+          doubaoThreadUrl: recoveryThreadUrl,
           rawVideoUrl: recovery.directVideoUrl,
-          cleanVideoUrl: recovery.directVideoUrl,
+          cleanVideoUrl: playbackUrl,
           outputVideoPath
         });
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -449,45 +455,56 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，已打开登录窗口，请登录后重试");
       }
 
+      const submissionMode = resolveSubmissionMode(account);
+
       const prepareSubmission = async (attempt: number) => {
         await progress({
           requestId,
           status: "running",
           message: attempt === 1
-            ? "正在切换豆包视频生成模式"
+            ? submissionMode === "text" ? "正在以文字描述方式提交（飞书账号无视频技能）" : "正在切换豆包视频生成模式"
             : `豆包繁忙，正在进行第 ${attempt}/3 次提交`
         });
-        await activateVideoMode(win!, request.model);
 
-        if (request.aspectRatio) {
-          await progress({
-            requestId,
-            status: "running",
-            message: `正在设置豆包画幅：${request.aspectRatio}`
-          });
-          const aspectRatioResult = await selectDoubaoAspectRatio(win!, request.aspectRatio);
-          await progress({
-            requestId,
-            status: "running",
-            message: aspectRatioResult.attempts > 0
-              ? `豆包画幅已确认：${aspectRatioResult.before || "未识别"} -> ${aspectRatioResult.after}（第 ${aspectRatioResult.attempts} 次）`
-              : `豆包画幅已确认：${aspectRatioResult.after}`
-          });
-        }
+        if (submissionMode === "skill") {
+          await activateVideoMode(win!, request.model);
 
-        // 豆包默认时长是 10 秒，必须在界面上真正选中目标时长；
-        // 只把「总时长 N 秒」写进提示词没用，页面选项胶囊会覆盖它。
-        if (request.duration) {
+          if (request.aspectRatio) {
+            await progress({
+              requestId,
+              status: "running",
+              message: `正在设置豆包画幅：${request.aspectRatio}`
+            });
+            const aspectRatioResult = await selectDoubaoAspectRatio(win!, request.aspectRatio);
+            await progress({
+              requestId,
+              status: "running",
+              message: aspectRatioResult.attempts > 0
+                ? `豆包画幅已确认：${aspectRatioResult.before || "未识别"} -> ${aspectRatioResult.after}（第 ${aspectRatioResult.attempts} 次）`
+                : `豆包画幅已确认：${aspectRatioResult.after}`
+            });
+          }
+
+          // 豆包默认时长是 10 秒，必须在界面上真正选中目标时长；
+          // 只把「总时长 N 秒」写进提示词没用，页面选项胶囊会覆盖它。
+          if (request.duration) {
+            await progress({
+              requestId,
+              status: "running",
+              message: `正在设置豆包时长：${request.duration} 秒`
+            });
+            const durationResult = await selectDoubaoDuration(win!, request.duration);
+            await progress({
+              requestId,
+              status: "running",
+              message: `豆包时长已处理：${durationResult.note || `${request.duration} 秒`}`
+            });
+          }
+        } else {
           await progress({
             requestId,
             status: "running",
-            message: `正在设置豆包时长：${request.duration} 秒`
-          });
-          const durationResult = await selectDoubaoDuration(win!, request.duration);
-          await progress({
-            requestId,
-            status: "running",
-            message: `豆包时长已处理：${durationResult.note || `${request.duration} 秒`}`
+            message: `该账号没有视频生成技能，模型/画幅/时长已写入对话：${formatGenerationSettings(request)}`
           });
         }
 
@@ -513,21 +530,23 @@ export class DoubaoExecutor {
             message: attempt === 1 ? `正在上传 ${mediaSummary}` : `正在重新上传 ${mediaSummary}`
           });
           await uploadReferenceMedia(win!, mediaPaths);
-          // 豆包在接收参考素材后会把输入框边的模式胶囊重置回普通对话，
-          // 导致后面的"发送前模型校验"直接失败、消息被打红叹号。
-          const requestedAfterUpload = request.model === "seedance_2_0_mini" ? "mini" : "fast";
-          const afterUpload = await inspectSelectedVideoModel(win!);
-          if (afterUpload.currentModel !== requestedAfterUpload) {
-            await progress({
-              requestId,
-              status: "running",
-              message: "参考素材上传后视频模式被重置，正在恢复视频生成模式"
-            });
-            await activateVideoMode(win!, request.model);
-            await wait(800);
-            const recovered = await inspectSelectedVideoModel(win!);
-            if (recovered.currentModel !== requestedAfterUpload) {
-              throw new Error(`参考素材上传后无法恢复视频生成模式：要求 ${doubaoVideoModelLabel(requestedAfterUpload)}，当前为 ${recovered.currentModel ? doubaoVideoModelLabel(recovered.currentModel) : "未识别"}`);
+          if (submissionMode === "skill") {
+            // 豆包在接收参考素材后会把输入框边的模式胶囊重置回普通对话，
+            // 导致后面的"发送前模型校验"直接失败、消息被打红叹号。
+            const requestedAfterUpload = request.model === "seedance_2_0_mini" ? "mini" : "fast";
+            const afterUpload = await inspectSelectedVideoModel(win!);
+            if (afterUpload.currentModel !== requestedAfterUpload) {
+              await progress({
+                requestId,
+                status: "running",
+                message: "参考素材上传后视频模式被重置，正在恢复视频生成模式"
+              });
+              await activateVideoMode(win!, request.model);
+              await wait(800);
+              const recovered = await inspectSelectedVideoModel(win!);
+              if (recovered.currentModel !== requestedAfterUpload) {
+                throw new Error(`参考素材上传后无法恢复视频生成模式：要求 ${doubaoVideoModelLabel(requestedAfterUpload)}，当前为 ${recovered.currentModel ? doubaoVideoModelLabel(recovered.currentModel) : "未识别"}`);
+              }
             }
           }
         }
@@ -537,7 +556,9 @@ export class DoubaoExecutor {
           status: "running",
           message: attempt === 1 ? "正在填写提示词" : "正在重新填写提示词"
         });
-        await fillPrompt(win!, promptWithVideoOptions(request));
+        await fillPrompt(win!, effectivePrompt(request, account));
+
+        if (submissionMode === "text") return;
 
         const selectedBeforeSubmit = await inspectSelectedVideoModel(win!);
         const requestedModel = request.model === "seedance_2_0_mini" ? "mini" : "fast";
@@ -573,7 +594,7 @@ export class DoubaoExecutor {
           await submitPromptAndWait(
             win,
             request.model,
-            promptWithVideoOptions(request),
+            effectivePrompt(request, account),
             async (message) => {
               await progress({ requestId, status: "running", message,
                 ...message === "已触发本任务发送，正在独立等待豆包受理确认" ? { submissionSentAt: new Date().toISOString() } : {} });
@@ -633,7 +654,7 @@ export class DoubaoExecutor {
         generationBaseline.videoUrls,
         generationBaseline.playableVideoCount,
         generationBaseline.videoCardCount,
-        promptWithVideoOptions(request),
+        effectivePrompt(request, account),
         submittedConversationUrl,
         async (message) => {
         await progress({ requestId, status: "running", executionPhase: /分享|复制/.test(message) ? "sharing" : "generating", message });
@@ -648,20 +669,27 @@ export class DoubaoExecutor {
         throw new Error(`视频已生成，但没有提取到本次视频的直链${generationResult.shareFailureReason ? `（${generationResult.shareFailureReason}）` : ""}`);
       }
       const doubaoThreadUrl = generationResult.shareUrl || submittedConversationUrl;
+      const cleanVideo = await resolveDoubaoCleanVideo(doubaoThreadUrl).catch(() => null);
+      const finalVideoUrl = cleanVideo?.url || videoUrl;
+      if (cleanVideo) {
+        await progress({ requestId, status: "running", executionPhase: "watermark", message: "已解析到无水印原片地址" });
+      }
       let outputVideoPath: string | null = null;
       if (settings.outputDir) {
         await progress({ requestId, status: "running", executionPhase: "output", message: "正在保存豆包返回的视频" });
-        try { outputVideoPath = await downloadVideoIfNeeded(settings, requestId, videoUrl); }
-        catch (error) { this.recordOperation(request, "保存视频", "failed", `视频链接已返回，本地保存失败：${errorMessage(error)}`, videoUrl); }
+        try { outputVideoPath = await downloadVideoIfNeeded(settings, requestId, finalVideoUrl); }
+        catch (error) { this.recordOperation(request, "保存视频", "failed", `视频链接已返回，本地保存失败：${errorMessage(error)}`, finalVideoUrl); }
       }
 
       await progress({
         requestId,
         status: "success",
-        message: outputVideoPath ? "视频生成完成，已返回豆包视频并保存到本地" : "视频生成完成，已返回豆包视频",
+        message: cleanVideo
+          ? outputVideoPath ? "视频生成完成，已返回无水印原片并保存到本地" : "视频生成完成，已返回无水印原片"
+          : outputVideoPath ? "视频生成完成，已返回豆包视频并保存到本地" : "视频生成完成，已返回豆包视频",
         doubaoThreadUrl,
         rawVideoUrl: videoUrl,
-        cleanVideoUrl: videoUrl,
+        cleanVideoUrl: finalVideoUrl,
         outputVideoPath
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -4180,6 +4208,40 @@ function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRat
 
 function promptWithVideoOptions(request: Pick<ApiRequest, "prompt" | "duration" | "resolution">) {
   return `${request.prompt.trim()}\n\n生成要求：视频总时长为 ${request.duration} 秒，分辨率为 ${request.resolution}。请按要求生成。`;
+}
+
+/**
+ * 飞书企业账号登录的豆包没有「视频生成」技能，斜杠命令和工具栏入口都不存在，
+ * 只能把模型、画幅、时长写进对话文字里让它自己调用 Seedance。
+ */
+export function resolveSubmissionMode(
+  account: Pick<Account, "loginMethod" | "videoSubmissionMode">,
+): "skill" | "text" {
+  if (account.videoSubmissionMode === "skill") return "skill";
+  if (account.videoSubmissionMode === "text") return "text";
+  return account.loginMethod === "feishu" ? "text" : "skill";
+}
+
+function promptForTextSubmission(
+  request: Pick<ApiRequest, "prompt" | "model" | "aspectRatio" | "duration" | "resolution">,
+) {
+  const model = request.model === "seedance_2_0_mini" ? "Seedance 2.0 mini" : "Seedance 2.0 fast";
+  return [
+    `请直接用 ${model} 生成一条视频，画幅 ${request.aspectRatio || "16:9"}，时长 ${request.duration} 秒，分辨率 ${request.resolution}。`,
+    "严格按下面的内容生成，不要改写、不要补充、不要反问确认：",
+    "",
+    request.prompt.trim(),
+  ].join("\n");
+}
+
+/** 同一次任务里所有环节（填写、提交、结果匹配）必须用同一份提示词。 */
+export function effectivePrompt(
+  request: Pick<ApiRequest, "prompt" | "model" | "aspectRatio" | "duration" | "resolution">,
+  account: Pick<Account, "loginMethod" | "videoSubmissionMode">,
+) {
+  return resolveSubmissionMode(account) === "text"
+    ? promptForTextSubmission(request)
+    : promptWithVideoOptions(request);
 }
 
 function extractPromptDuration(prompt: string) {

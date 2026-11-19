@@ -9,6 +9,7 @@ const api = {
     delete: (id: number) => ipcRenderer.invoke("accounts:delete", id),
     open: (id: number) => ipcRenderer.invoke("accounts:open", id),
     relogin: (id: number) => ipcRenderer.invoke("accounts:relogin", id),
+    openFeishuLogin: (id: number) => ipcRenderer.invoke("accounts:open-feishu-login", id),
     detectLogin: (id: number) => ipcRenderer.invoke("accounts:detect-login", id),
     detectAll: () => ipcRenderer.invoke("accounts:detect-all"),
     resetQuota: (id: number) => ipcRenderer.invoke("accounts:reset-quota", id),

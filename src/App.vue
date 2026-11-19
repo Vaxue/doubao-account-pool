@@ -5,6 +5,7 @@ import { failureStageLabels, getRequestError, requestPhase } from "../electron/r
 import { quotaAmount, quotaRuns } from "../electron/quota-amount";
 import type {
   Account,
+  AccountLoginMethod,
   AccountRuntimeStatus,
   ApiRequest,
   ApiRequestStatus,
@@ -15,7 +16,8 @@ import type {
   OperationLog,
   OperationLogStatus,
   FailureStage,
-  RequestStats
+  RequestStats,
+  VideoSubmissionMode
 } from "../electron/types";
 
 type TabKey = "accounts" | "settings" | "logs" | "actions";
@@ -56,8 +58,22 @@ const copiedField = ref<"prompt" | "result" | null>(null);
 const accountSettingsForm = reactive({
   remark: "",
   dailyQuotaLimit: 10,
-  quotaUsedToday: 0
+  quotaUsedToday: 0,
+  loginMethod: "unknown" as AccountLoginMethod,
+  videoSubmissionMode: "auto" as VideoSubmissionMode
 });
+
+const loginMethodLabels: Record<AccountLoginMethod, string> = {
+  unknown: "登录方式未识别",
+  feishu: "飞书登录",
+  native: "豆包原生登录"
+};
+
+const submissionModeLabels: Record<VideoSubmissionMode, string> = {
+  auto: "自动",
+  skill: "视频技能",
+  text: "文字描述"
+};
 
 const settingsForm = reactive<AppSettings>({
   apiServiceEnabled: true,
@@ -289,6 +305,18 @@ async function detectAll() {
   await refresh();
 }
 
+async function feishuLogin(account: Account) {
+  try {
+    const result = await window.doubaoManager.accounts.openFeishuLogin(account.id);
+    notice.value = result.clicked
+      ? "已打开飞书登录，请输入飞书手机号并接收验证码"
+      : "窗口已打开，但没找到飞书登录入口，请手动点击「飞书企业账号登录」";
+    await refresh();
+  } catch (error) {
+    notice.value = error instanceof Error ? error.message : "无法打开飞书登录";
+  }
+}
+
 async function relogin(account: Account) {
   if (!window.confirm(`清空 ${account.partition} 的登录状态并重新打开豆包？`)) return;
   await window.doubaoManager.accounts.relogin(account.id);
@@ -321,6 +349,8 @@ function openAccountSettings(account: Account) {
   accountSettingsForm.remark = account.remark;
   accountSettingsForm.dailyQuotaLimit = account.dailyQuotaLimit;
   accountSettingsForm.quotaUsedToday = account.quotaUsedToday;
+  accountSettingsForm.loginMethod = account.loginMethod ?? "unknown";
+  accountSettingsForm.videoSubmissionMode = account.videoSubmissionMode ?? "auto";
 }
 
 function closeAccountSettings() {
@@ -336,7 +366,9 @@ async function saveAccountSettings() {
     remark: accountSettingsForm.remark.trim(),
     dailyQuotaLimit: total,
     quotaRemaining: quotaAmount(total - used),
-    quotaUsedToday: used
+    quotaUsedToday: used,
+    loginMethod: accountSettingsForm.loginMethod,
+    videoSubmissionMode: accountSettingsForm.videoSubmissionMode
   });
   closeAccountSettings();
   await refresh();
@@ -737,7 +769,7 @@ onBeforeUnmount(() => {
                 </div>
                 <span class="account-task-count">执行 {{ account.runningTaskCount ?? (accountTask(account)?.status === 'running' ? 1 : 0) }}/{{ account.maxConcurrentTasks || savedSettings?.maxConcurrentTasksPerAccount || 3 }}<span>排队 {{ account.queuedTaskCount ?? (accountTask(account)?.status === 'accepted' ? 1 : 0) }}</span></span>
                 <span v-if="accountTask(account)" class="account-task-detail" :title="accountTask(account)?.message">{{ accountTask(account)?.message }}</span>
-                <span v-else class="account-login-state">{{ loginLabels[account.loginStatus] }}</span>
+                <span v-else class="account-login-state">{{ loginLabels[account.loginStatus] }} · {{ loginMethodLabels[account.loginMethod] || "登录方式未识别" }}<template v-if="(account.videoSubmissionMode || 'auto') !== 'auto'"> · {{ submissionModeLabels[account.videoSubmissionMode] }}</template></span>
               </td>
               <td class="quota-cell">
                 <div v-if="account.dailyQuotaExhausted" class="quota-heading" :title="account.quotaExhaustedReason || ''">
@@ -767,6 +799,7 @@ onBeforeUnmount(() => {
                       <button type="button" @click="openAccountMenuId = null; openAccountSettings(account)">账号设置</button>
                       <button type="button" @click="openAccountMenuId = null; resetQuota(account)">重置今日额度</button>
                       <button type="button" @click="openAccountMenuId = null; relogin(account)">清空登录状态</button>
+                      <button type="button" @click="openAccountMenuId = null; feishuLogin(account)">用飞书账号登录</button>
                       <span class="menu-separator"></span>
                       <button class="danger-text" type="button" @click="openAccountMenuId = null; deleteAccount(account)">删除账号</button>
                     </div>
@@ -1161,6 +1194,22 @@ onBeforeUnmount(() => {
         <label>
           <span>备注</span>
           <input v-model="accountSettingsForm.remark" placeholder="例如 主号、备用号、客户 A" />
+        </label>
+        <label>
+          <span>登录方式</span>
+          <select v-model="accountSettingsForm.loginMethod">
+            <option value="unknown">未识别（自动判断）</option>
+            <option value="feishu">飞书企业账号</option>
+            <option value="native">豆包原生账号</option>
+          </select>
+        </label>
+        <label>
+          <span>视频提交方式</span>
+          <select v-model="accountSettingsForm.videoSubmissionMode">
+            <option value="auto">自动（飞书走文字描述）</option>
+            <option value="skill">视频技能（/视频生成）</option>
+            <option value="text">文字描述（无技能时用）</option>
+          </select>
         </label>
         <label>
           <span>每日总额度</span>

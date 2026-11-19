@@ -11,6 +11,7 @@ import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
 import { toPublicApiRequest } from "./public-api.js";
 import type {
+  AccountLoginMethod,
   AccountUpdateInput,
   ApiRequest,
   ApiServerStatus,
@@ -389,6 +390,55 @@ function createDoubaoWindow(accountId: number) {
   });
 
   void win.loadURL("https://www.doubao.com/chat");
+  return win;
+}
+
+/**
+ * 登录页没有稳定的元素 id，这里按文案找「飞书企业账号登录」入口。
+ * 找不到不算失败：窗口已经打开，用户可以手点，只是少一步自动化。
+ */
+async function clickFeishuLoginEntry(win: BrowserWindow, attempts = 15) {
+  const script = `(() => {
+    const textOf = (node) => (node.textContent || "").replace(/\\s+/g, "");
+    const nodes = Array.from(document.querySelectorAll("button, a, [role='button'], div, span"));
+    const hit = nodes.find((node) => {
+      const text = textOf(node);
+      return text.includes("飞书") && text.length > 0 && text.length <= 24;
+    });
+    if (!hit) return false;
+    const clickable = hit.closest("button, a, [role='button']") || hit;
+    clickable.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    return true;
+  })()`;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (win.isDestroyed()) return false;
+    try {
+      const clicked = await win.webContents.executeJavaScript(script, true);
+      if (clicked) return true;
+    } catch {
+      // 页面还在加载，继续等
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+  return false;
+}
+
+const FEISHU_COOKIE_DOMAINS = [".feishu.cn", ".feishu.net", ".larksuite.com", ".larkoffice.com"];
+
+/**
+ * 飞书企业账号登录会在该账号的 partition 里留下飞书域名的会话 cookie；
+ * 用这个判断登录来源，比看页面文案稳定，也不会误伤普通手机号账号。
+ */
+async function detectLoginMethod(
+  accountSession: Electron.Session,
+  loggedIn: boolean
+): Promise<AccountLoginMethod> {
+  if (!loggedIn) return "unknown";
+  for (const domain of FEISHU_COOKIE_DOMAINS) {
+    const cookies = await accountSession.cookies.get({ domain }).catch(() => []);
+    if (cookies.length > 0) return "feishu";
+  }
+  return "native";
 }
 
 async function detectLoginStatus(accountId: number) {
@@ -397,11 +447,14 @@ async function detectLoginStatus(accountId: number) {
 
   const accountSession = session.fromPartition(account.partition);
   const cookies = await accountSession.cookies.get({ url: "https://www.doubao.com" });
+  const loggedIn = cookies.length > 0;
+  const loginMethod = await detectLoginMethod(accountSession, loggedIn);
   const activeRequest = account.runningTaskCount + account.queuedTaskCount > 0;
   return db.updateAccount({
     id: accountId,
-    loginStatus: cookies.length > 0 ? "logged_in" : "logged_out",
-    currentStatus: cookies.length > 0
+    loginStatus: loggedIn ? "logged_in" : "logged_out",
+    loginMethod,
+    currentStatus: loggedIn
       ? activeRequest
         ? "busy"
         : "idle"
@@ -573,6 +626,22 @@ function registerIpc() {
     createDoubaoWindow(id);
     recordOperation(null, id, "重新登录账号", "success", "已清空登录状态并打开登录窗口");
     return true;
+  });
+  ipcMain.handle("accounts:open-feishu-login", async (_event, id: number) => {
+    const account = db.getAccount(id);
+    if (!account) throw new Error("Account not found");
+    await clearAccountSession(id);
+    const win = createDoubaoWindow(id);
+    const clicked = await clickFeishuLoginEntry(win);
+    db.updateAccount({
+      id,
+      loginStatus: "logged_out",
+      loginMethod: clicked ? "feishu" : account.loginMethod,
+      currentStatus: "login_required"
+    });
+    recordOperation(null, id, "飞书账号登录", clicked ? "success" : "failed",
+      clicked ? "已打开登录窗口并点击「飞书企业账号登录」，请用飞书手机号完成验证" : "已打开登录窗口，但没找到飞书登录入口，请手动点击");
+    return { clicked };
   });
   ipcMain.handle("accounts:detect-login", async (_event, id: number) => {
     const account = await detectLoginStatus(id);

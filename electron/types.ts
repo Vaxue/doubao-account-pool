@@ -1,4 +1,8 @@
 export type LoginStatus = "unknown" | "logged_in" | "logged_out";
+/** 账号的登录来源：飞书企业账号登录的豆包没有「视频生成」技能，需要走文字描述。 */
+export type AccountLoginMethod = "unknown" | "feishu" | "native";
+/** 视频提交方式：auto 按登录方式自动选择，skill 走 /视频生成 技能，text 直接发文字描述。 */
+export type VideoSubmissionMode = "auto" | "skill" | "text";
 export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
 export type DoubaoAspectRatio = "9:16" | "16:9";
@@ -44,6 +48,8 @@ export interface Account {
   partition: string;
   remark: string;
   loginStatus: LoginStatus;
+  loginMethod: AccountLoginMethod;
+  videoSubmissionMode: VideoSubmissionMode;
   currentStatus: AccountRuntimeStatus;
   dailyQuotaLimit: number;
   quotaRemaining: number;
@@ -70,6 +76,8 @@ export interface AccountUpdateInput {
   id: number;
   remark?: string;
   loginStatus?: LoginStatus;
+  loginMethod?: AccountLoginMethod;
+  videoSubmissionMode?: VideoSubmissionMode;
   currentStatus?: AccountRuntimeStatus;
   dailyQuotaLimit?: number;
   quotaRemaining?: number;

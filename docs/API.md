@@ -94,7 +94,7 @@ Content-Type: multipart/form-data
 - 同一台电脑上的画布使用 `http://127.0.0.1:17888`；远程画布应通过受保护的 HTTPS 代理或隧道访问，不要把本地端口无认证暴露到公网。
 - 有回调服务时传入 `callbackUrl`；没有回调服务时按 3 到 5 秒轮询 `GET /api/requests/:requestId`。
 - 画布必须按 `requestId` 更新原任务，即使多个任务的账号、标题或提示词相同，也不能合并判断。
-- `cleanVideoUrl` 是豆包对话页提取的视频直链；`outputVideoPath` 只能是已经存在的本地 `.mp4` 文件。
+- `cleanVideoUrl` 优先返回解析出的无水印原片地址（分享页 `fallback_api` + `key_seed` 解密），解析失败时回退为豆包对话页提取的视频直链，不会因此把任务判失败；`outputVideoPath` 只能是已经存在的本地 `.mp4` 文件。
 - `doubao.com/chat/...`、`doubao.com/thread/...` 和分享页地址只用于账号池内部定位对应对话，不作为视频结果返回。
 - 本地账号分区、Cookie、SQLite、参考图、输出视频和 Token 不属于接口参数，也不会随 Git 发布。
 

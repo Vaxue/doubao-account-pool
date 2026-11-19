@@ -20,6 +20,7 @@ declare global {
         delete: (id: number) => Promise<boolean>;
         open: (id: number) => Promise<void>;
         relogin: (id: number) => Promise<boolean>;
+        openFeishuLogin: (id: number) => Promise<{ clicked: boolean }>;
         detectLogin: (id: number) => Promise<Account>;
         detectAll: () => Promise<Account[]>;
         resetQuota: (id: number) => Promise<Account>;

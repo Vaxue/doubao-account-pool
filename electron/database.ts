@@ -82,6 +82,8 @@ export class AppDatabase {
         partition TEXT NOT NULL UNIQUE,
         remark TEXT NOT NULL DEFAULT '',
         login_status TEXT NOT NULL DEFAULT 'unknown',
+        login_method TEXT NOT NULL DEFAULT 'unknown',
+        video_submission_mode TEXT NOT NULL DEFAULT 'auto',
         current_status TEXT NOT NULL DEFAULT 'idle',
         daily_quota_limit INTEGER NOT NULL DEFAULT 10,
         quota_remaining INTEGER NOT NULL DEFAULT 10,
@@ -166,6 +168,8 @@ export class AppDatabase {
         partition,
         remark,
         login_status AS loginStatus,
+        login_method AS loginMethod,
+        video_submission_mode AS videoSubmissionMode,
         current_status AS currentStatus,
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
@@ -189,6 +193,8 @@ export class AppDatabase {
         partition,
         remark,
         login_status AS loginStatus,
+        login_method AS loginMethod,
+        video_submission_mode AS videoSubmissionMode,
         current_status AS currentStatus,
         daily_quota_limit AS dailyQuotaLimit,
         quota_remaining AS quotaRemaining,
@@ -248,6 +254,8 @@ export class AppDatabase {
     const updated = {
       remark: input.remark ?? existing.remark,
       loginStatus: input.loginStatus ?? existing.loginStatus,
+      loginMethod: input.loginMethod ?? existing.loginMethod,
+      videoSubmissionMode: input.videoSubmissionMode ?? existing.videoSubmissionMode,
       currentStatus: input.currentStatus ?? existing.currentStatus,
       dailyQuotaLimit: input.dailyQuotaLimit ?? existing.dailyQuotaLimit,
       quotaRemaining: input.quotaRemaining ?? existing.quotaRemaining,
@@ -260,6 +268,8 @@ export class AppDatabase {
       SET
         remark = ?,
         login_status = ?,
+        login_method = ?,
+        video_submission_mode = ?,
         current_status = ?,
         daily_quota_limit = ?,
         quota_remaining = ?,
@@ -269,6 +279,8 @@ export class AppDatabase {
     `).run(
       updated.remark.trim(),
       updated.loginStatus,
+      updated.loginMethod,
+      updated.videoSubmissionMode,
       updated.currentStatus,
       clampInt(updated.dailyQuotaLimit),
       quotaAmount(updated.quotaRemaining),
@@ -1020,6 +1032,8 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "name", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("accounts", "remark", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("accounts", "current_status", "TEXT NOT NULL DEFAULT 'idle'");
+    this.addColumnIfMissing("accounts", "login_method", "TEXT NOT NULL DEFAULT 'unknown'");
+    this.addColumnIfMissing("accounts", "video_submission_mode", "TEXT NOT NULL DEFAULT 'auto'");
     this.addColumnIfMissing("accounts", "daily_quota_limit", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("accounts", "quota_remaining", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("accounts", "quota_used_today", "INTEGER NOT NULL DEFAULT 0");
