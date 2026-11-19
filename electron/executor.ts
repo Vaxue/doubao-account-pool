@@ -4228,6 +4228,8 @@ function promptForTextSubmission(
   const model = request.model === "seedance_2_0_mini" ? "Seedance 2.0 mini" : "Seedance 2.0 fast";
   return [
     `请直接用 ${model} 生成一条视频，画幅 ${request.aspectRatio || "16:9"}，时长 ${request.duration} 秒，分辨率 ${request.resolution}。`,
+    "生成前先自查一遍脚本有没有问题，确认没问题就直接生成，不用再和我确认。",
+    "时长按要求给到就好，可以多但是不能少。",
     "严格按下面的内容生成，不要改写、不要补充、不要反问确认：",
     "",
     request.prompt.trim(),
