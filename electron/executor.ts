@@ -1682,6 +1682,7 @@ async function waitForDoubaoVideoModelOption(
 type DoubaoAspectRatioState = {
   currentAspectRatio: DoubaoAspectRatio | null;
   summary: string | null;
+  scoped?: boolean;
   labels: string[];
 };
 
@@ -1721,26 +1722,36 @@ async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
         if (rect.height > 520) break;
         if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
       }
-      const sourceNodes = composerRoot
-        ? [composerRoot, ...Array.from(composerRoot.querySelectorAll('*'))]
-        : Array.from(document.querySelectorAll('body *'));
-      const items = sourceNodes
-        .filter(visible)
-        .map((el) => {
-          const interactive = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]');
-          const clickable = interactive || (getComputedStyle(el).cursor === "pointer" ? el : null);
-          const rect = (clickable || el).getBoundingClientRect();
-          const text = textOf(el);
-          return {
-            el,
-            text,
-            ratio: ratioFromText(text),
-            summary: Boolean(clickable) && isTriggerText(text)
-              && (!composerRoot || composerRoot.contains(clickable)),
-            rect
-          };
-        })
-        .filter((item) => item.ratio || item.summary);
+      // 新版界面可能把画幅胶囊放在输入框容器之外（例如工具栏单独一层），
+      // 只在 composerRoot 里找会一个候选都拿不到。这里改成两级搜索：
+      // 先按 composerRoot 收缩范围，若一个都没命中则回退到整页。
+      const collect = (root) => {
+        const nodes = root
+          ? [root, ...Array.from(root.querySelectorAll('*'))]
+          : Array.from(document.querySelectorAll('body *'));
+        return nodes
+          .filter(visible)
+          .map((el) => {
+            const interactive = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]');
+            const clickable = interactive || (getComputedStyle(el).cursor === "pointer" ? el : null);
+            const rect = (clickable || el).getBoundingClientRect();
+            const text = textOf(el);
+            return {
+              el,
+              text,
+              ratio: ratioFromText(text),
+              summary: Boolean(clickable) && isTriggerText(text),
+              rect
+            };
+          })
+          .filter((item) => item.ratio || item.summary);
+      };
+      let items = collect(composerRoot);
+      let scoped = true;
+      if (!items.length && composerRoot) {
+        items = collect(null);
+        scoped = false;
+      }
       const trigger = items
         .filter((item) => item.summary)
         .sort((a, b) => b.rect.bottom - a.rect.bottom || a.text.length - b.text.length)[0];
@@ -1749,6 +1760,7 @@ async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
         // option in an open popover does not prove that Doubao applied it.
         currentAspectRatio: trigger?.ratio || null,
         summary: trigger?.text || null,
+        scoped,
         labels: items.map((item) => item.text).slice(0, 12)
       };
     })()
@@ -1791,28 +1803,29 @@ async function clickDoubaoAspectRatioTrigger(win: BrowserWindow) {
         if (rect.height > 520) break;
         if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
       }
-      const sourceNodes = composerRoot
-        ? [composerRoot, ...Array.from(composerRoot.querySelectorAll('*'))]
-        : Array.from(document.querySelectorAll('body *'));
-      const candidates = sourceNodes
-        .filter(visible)
-        .map((el) => {
-          const text = textOf(el);
-          const clickable = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]')
-            || (getComputedStyle(el).cursor === "pointer" ? el : null);
-          if (!clickable) return null;
-          const rect = clickable.getBoundingClientRect();
-          return {
-            text,
-            clickable,
-            inToolbarRegion: !composerRoot || composerRoot.contains(clickable),
-            rect
-          };
-        })
-        .filter(Boolean)
-        .filter((item) => item.inToolbarRegion && isTriggerText(item.text))
-        .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
-        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      const collect = (root) => {
+        const nodes = root
+          ? [root, ...Array.from(root.querySelectorAll('*'))]
+          : Array.from(document.querySelectorAll('body *'));
+        return nodes
+          .filter(visible)
+          .map((el) => {
+            const text = textOf(el);
+            const clickable = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]')
+              || (getComputedStyle(el).cursor === "pointer" ? el : null);
+            if (!clickable) return null;
+            const rect = clickable.getBoundingClientRect();
+            return { text, clickable, rect };
+          })
+          .filter(Boolean)
+          .filter((item) => isTriggerText(item.text))
+          .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
+          .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      };
+      // 与 inspect 保持一致：容器内先找，找不到再回退整页，避免新版把
+      // 画幅入口挪出输入框容器后彻底点不到。
+      let candidates = collect(composerRoot);
+      if (!candidates.length && composerRoot) candidates = collect(null);
       const target = candidates[0];
       if (!target) return null;
       return {
@@ -1857,12 +1870,11 @@ async function clickExactDoubaoAspectRatioOption(win: BrowserWindow, targetRatio
           if (!visible(parent)) continue;
           const rect = parent.getBoundingClientRect();
           const text = compactText(parent);
-          if (rect.width <= 720
-            && rect.height <= 720
-            && text.includes("比例")
-            && text.includes("自动")
-            && text.includes("9:16")
-            && text.includes("16:9")) {
+          // 新版弹窗标题不一定写「比例」，也可能直接列 16:9 / 9:16 / 自动。
+          // 只要这块容器里同时出现两种以上比例选项，就认定为比例弹层。
+          const ratioHits = ["自动", "9:16", "16:9", "1:1", "4:3", "3:4", "21:9"]
+            .filter((token) => text.includes(token)).length;
+          if (rect.width <= 720 && rect.height <= 720 && ratioHits >= 2) {
             return true;
           }
         }
@@ -2081,12 +2093,51 @@ async function selectDoubaoAspectRatio(win: BrowserWindow, targetRatio: DoubaoAs
   }
 
   const state = await waitForDoubaoAspectRatioState(win, () => false, 600);
+  let toolbarHint = "";
+  try {
+    toolbarHint = await inspectDoubaoToolbarTexts(win);
+  } catch {
+    toolbarHint = "";
+  }
   throw new Error(
     `豆包画幅未确认：要求 ${targetRatio}，当前为 ${state.currentAspectRatio || "未识别"}`
       + `；页面 ${win.webContents.getURL()}`
       + `；可见画幅 ${state.labels.join(" | ") || "无"}`
+      + (state.scoped === false ? "；画幅入口不在输入框容器内（已回退整页搜索）" : "")
+      + (toolbarHint ? `；工具栏可见文字 ${toolbarHint}` : "")
       + `；${diagnostics.join("；") || "未取得有效操作诊断"}`
   );
+}
+
+/** 仅在排错时调用：把工具栏附近真实可见的短文字回传，便于判断新版界面改了什么。 */
+async function inspectDoubaoToolbarTexts(win: BrowserWindow) {
+  return runPageScript<string>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const texts = [];
+      const seen = new Set();
+      for (const el of Array.from(document.querySelectorAll('button, [role="button"], [aria-haspopup], [tabindex]'))) {
+        if (!visible(el)) continue;
+        if (el.querySelector('button, [role="button"]')) continue;
+        const raw = (el.innerText || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\\s+/g, " ").trim();
+        if (!raw || raw.length > 24) continue;
+        if (seen.has(raw)) continue;
+        seen.add(raw);
+        texts.push(raw);
+        if (texts.length >= 18) break;
+      }
+      return texts.join(" | ");
+    })()
+  `);
 }
 
 export async function submitPromptAndWait(

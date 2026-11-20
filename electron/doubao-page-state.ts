@@ -59,7 +59,15 @@ export function isDoubaoAspectRatioTriggerText(value: string | null | undefined)
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text || text.length > 48) return false;
   // 新版把比例与时长合成一个胶囊（如 "自动 · 10" / "16:9 · 15"），单位可能不出现。
-  return /^(?:(?:画面)?(?:比例|画幅)\s*[:：]?\s*)?(?:自动|9:16|16:9|3:4|4:3|1:1|21:9)(?:\s*(?:[·•|,/]|-|—)?\s*\d+(?:\.\d+)?\s*(?:s|秒)?)?$/i.test(text);
+  // 也兼容后面带「横屏/竖屏/方形」等中文后缀、或前缀带「画面/画幅/比例」的写法。
+  const RATIO = "(?:自动|9:16|16:9|3:4|4:3|1:1|21:9)(?!\\d)";
+  const SUFFIX = "(?:\\s*(?:横屏|竖屏|方形|宽屏|超宽|比例))?";
+  const DURATION = "(?:\\s*(?:[·•|,/]|-|—)?\\s*\\d+(?:\\.\\d+)?\\s*(?:s|秒)?)?";
+  const re = new RegExp(
+    `^(?:(?:画面|画幅|比例)\\s*[:：]?\\s*)?${RATIO}${SUFFIX}${DURATION}$`,
+    "i"
+  );
+  return re.test(text);
 }
 
 const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|chat|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
