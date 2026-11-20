@@ -38,13 +38,21 @@ export function doubaoVideoModelFromText(value: string | null | undefined): Doub
 
 export function isDoubaoVideoModelTriggerText(value: string | null | undefined) {
   // 自包含：本函数会被 toString() 注入网页脚本，不能引用模块内的其他函数。
-  const compact = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-  if (!compact || compact.length > 40) return false;
+  const raw = String(value || "").trim();
+  // 工具栏胶囊形如「Seedance 2.0 Fast」或「模型 Seedance 2.0 Fast」，很短。
+  // 侧栏历史对话标题形如「Seedance 2.0 fast原创3D半写实国漫制作」，长得多，
+  // 必须先按原始长度挡掉，否则会被误当成当前已选模型。
+  if (!raw || raw.length > 28) return false;
+  const compact = raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (!compact || compact.length > 22) return false;
   const index = compact.indexOf("seedance20");
   if (index < 0) return false;
+  // seedance20 之前只允许出现「模型/model」这类前缀，不允许夹带中文标题内容。
+  const prefix = compact.slice(0, index);
+  if (prefix && prefix !== "模型" && prefix !== "model" && prefix !== "mx") return false;
   const rest = compact.slice(index + "seedance20".length);
-  return rest.startsWith("mini") || rest.startsWith("mi")
-    || rest.startsWith("fast") || rest.startsWith("fas") || rest.startsWith("fa") || rest.startsWith("f");
+  // 后面必须紧接版本词并且到此为止，不接受「fast原创…」这种续写。
+  return /^(?:mini|mi|fast|fas|fa|f)$/.test(rest);
 }
 
 export function doubaoAspectRatioFromText(value: string | null | undefined) {

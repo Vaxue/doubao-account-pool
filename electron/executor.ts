@@ -1490,24 +1490,30 @@ async function inspectSelectedVideoModel(win: BrowserWindow) {
         .filter((el) => visible(el) && !el.disabled && !el.readOnly)
         .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
       const editor = editors[0] || null;
-      const editorRect = editor?.getBoundingClientRect() || null;
+      // 必须限定在输入框所在容器内。侧栏历史对话标题常被命名成
+      //「Seedance 2.0 fast原创3D半写实国漫…」，只靠「输入框上方 320px」的话
+      // 会把它们误认成工具栏模型胶囊，导致误判「已在视频模式」而完全不点视频入口。
+      let composerRoot = editor;
+      for (let parent = editor?.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth += 1) {
+        const rect = parent.getBoundingClientRect();
+        if (rect.height > 520) break;
+        if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
+      }
       const nodes = Array.from(document.querySelectorAll('body *'))
         .filter(visible)
         .map((el) => {
           const text = textOf(el);
           const rect = el.getBoundingClientRect();
           return {
+            el,
             text,
             model: modelFromText(text),
             rect,
-            toolbarLabel: isModelTriggerText(text),
-            nearEditor: Boolean(editorRect
-              && rect.bottom >= editorRect.top - 320
-              && rect.top <= editorRect.bottom + 40
-              && rect.bottom > window.innerHeight * 0.45)
+            toolbarLabel: isModelTriggerText(text)
           };
         })
-        .filter((item) => item.model && item.toolbarLabel && item.nearEditor)
+        .filter((item) => item.model && item.toolbarLabel
+          && (composerRoot ? composerRoot.contains(item.el) : true))
         .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       const trigger = nodes[0];
       return {
@@ -1542,7 +1548,14 @@ async function clickDoubaoModelTrigger(win: BrowserWindow) {
         .filter((el) => visible(el) && !el.disabled && !el.readOnly)
         .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
       const editor = editors[0] || null;
-      const editorRect = editor?.getBoundingClientRect() || null;
+      // 与 inspectSelectedVideoModel 保持一致：只在输入框容器内找模型胶囊，
+      // 避免把侧栏同名历史对话标题当成模型入口去点。
+      let composerRoot = editor;
+      for (let parent = editor?.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth += 1) {
+        const rect = parent.getBoundingClientRect();
+        if (rect.height > 520) break;
+        if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
+      }
       const candidates = Array.from(document.querySelectorAll('body *'))
         .filter(visible)
         .map((el) => {
@@ -1556,13 +1569,10 @@ async function clickDoubaoModelTrigger(win: BrowserWindow) {
             rect,
             optionLike: Boolean(el.closest('[role="option"], [role="menuitem"], [role="listbox"]')),
             toolbarLabel: isModelTriggerText(text),
-            nearEditor: Boolean(editorRect
-              && rect.bottom >= editorRect.top - 320
-              && rect.top <= editorRect.bottom + 40
-              && rect.bottom > window.innerHeight * 0.45)
+            inComposer: Boolean(composerRoot && composerRoot.contains(el))
           };
         })
-        .filter((item) => item.nearEditor && item.toolbarLabel && item.model)
+        .filter((item) => item.inComposer && item.toolbarLabel && item.model)
         .filter((item) => !item.optionLike)
         .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
         .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
