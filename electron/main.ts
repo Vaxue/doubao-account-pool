@@ -426,19 +426,24 @@ async function clickFeishuLoginEntry(win: BrowserWindow, attempts = 15) {
 const FEISHU_COOKIE_DOMAINS = [".feishu.cn", ".feishu.net", ".larksuite.com", ".larkoffice.com"];
 
 /**
- * 飞书企业账号登录会在该账号的 partition 里留下飞书域名的会话 cookie；
- * 用这个判断登录来源，比看页面文案稳定，也不会误伤普通手机号账号。
+ * 只做「正向」识别：确实发现飞书域名 cookie 才判定 feishu。
+ *
+ * 注意：飞书企业账号通过 SSO 登录后，飞书授权 cookie 通常留在独立授权窗口，
+ * 不会落进豆包的 partition，因此检测不到飞书 cookie 是常态。这里绝不能因为
+ * 「没发现飞书 cookie」就返回 native 去覆盖用户手动指定的 feishu——否则飞书
+ * 账号会被误判成原生账号，走它没有的 /视频生成 技能而失败。找不到证据时返回
+ * null，由调用方保留已有值。
  */
 async function detectLoginMethod(
   accountSession: Electron.Session,
   loggedIn: boolean
-): Promise<AccountLoginMethod> {
-  if (!loggedIn) return "unknown";
+): Promise<AccountLoginMethod | null> {
+  if (!loggedIn) return null;
   for (const domain of FEISHU_COOKIE_DOMAINS) {
     const cookies = await accountSession.cookies.get({ domain }).catch(() => []);
     if (cookies.length > 0) return "feishu";
   }
-  return "native";
+  return null;
 }
 
 async function detectLoginStatus(accountId: number) {
@@ -448,7 +453,10 @@ async function detectLoginStatus(accountId: number) {
   const accountSession = session.fromPartition(account.partition);
   const cookies = await accountSession.cookies.get({ url: "https://www.doubao.com" });
   const loggedIn = cookies.length > 0;
-  const loginMethod = await detectLoginMethod(accountSession, loggedIn);
+  const detectedLoginMethod = await detectLoginMethod(accountSession, loggedIn);
+  // 手动指定的登录方式优先：只有确实检测到飞书 cookie 才覆盖为 feishu，
+  // 否则保留已有值（含用户手动选的 feishu / text 提交模式对应的账号）。
+  const loginMethod = detectedLoginMethod || account.loginMethod;
   const activeRequest = account.runningTaskCount + account.queuedTaskCount > 0;
   return db.updateAccount({
     id: accountId,

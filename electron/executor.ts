@@ -455,7 +455,29 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，已打开登录窗口，请登录后重试");
       }
 
-      const submissionMode = resolveSubmissionMode(account);
+      let submissionMode = resolveSubmissionMode(account);
+
+      // 飞书企业账号没有 /视频生成 技能。若 skill 模式提交时明确报「没有视频入口」，
+      // 自动降级为文字描述模式重投，并把账号标记为 feishu/text，避免以后反复踩坑。
+      const isMissingVideoSkillError = (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return /没有出现视频|未找到视频生成入口|未出现视频模型工具栏|没有视频生成技能/.test(message);
+      };
+      const downgradeToTextMode = async () => {
+        submissionMode = "text";
+        account.loginMethod = "feishu";
+        account.videoSubmissionMode = "text";
+        this.database.updateAccount({
+          id: account.id,
+          loginMethod: "feishu",
+          videoSubmissionMode: "text"
+        });
+        await progress({
+          requestId,
+          status: "running",
+          message: "检测到该账号没有视频生成技能，已自动切换为文字描述模式重试"
+        });
+      };
 
       const prepareSubmission = async (attempt: number) => {
         await progress({
@@ -570,8 +592,24 @@ export class DoubaoExecutor {
       };
 
       let generationBaseline!: Awaited<ReturnType<typeof inspectGenerationPage>>;
+      let downgradedInThisRun = false;
       for (let submissionAttempt = 1; submissionAttempt <= 3; submissionAttempt += 1) {
-        await prepareSubmission(submissionAttempt);
+        try {
+          await prepareSubmission(submissionAttempt);
+        } catch (error) {
+          // skill 模式找不到视频入口 → 该账号多半是飞书企业版，自动降级文字模式重投一次。
+          // downgradedInThisRun 保证每次执行只降级一次，不会因 text 再失败而反复重载。
+          if (submissionMode === "skill" && !downgradedInThisRun && isMissingVideoSkillError(error)) {
+            downgradedInThisRun = true;
+            await downgradeToTextMode();
+            await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
+            await wait(2500);
+            await dismissDoubaoDesktopDownloadPrompt(win);
+            submissionAttempt -= 1; // 降级重投不消耗重试次数
+            continue;
+          }
+          throw error;
+        }
         await progress({
           requestId,
           status: "running",
